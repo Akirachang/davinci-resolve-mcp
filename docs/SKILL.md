@@ -162,6 +162,9 @@ Key actions:
 - `get_mark_in_out`, `set_mark_in_out(mark_in, mark_out, type?)`
 - `duplicate(name?)` — duplicate the current timeline
 - `get_voice_isolation_state(track_index)` / `set_voice_isolation_state`
+- `extract_source_frame_ranges(handles?, gap_max?, skip_extensions?)` — return
+  inclusive source frame ranges for current-timeline video clips, with fixed
+  handles or gap-only auto handles when `handles=0`
 
 **`timeline_markers`** — Markers and playhead on the current timeline.
 
