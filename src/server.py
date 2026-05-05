@@ -10,7 +10,7 @@ Usage:
     python src/server.py --full       # Start the 328-tool granular server instead
 """
 
-VERSION = "2.3.3"
+VERSION = "2.3.4"
 
 import base64
 import os
@@ -18,6 +18,7 @@ import sys
 import json
 import logging
 import platform
+import re
 import subprocess
 import tempfile
 import time
@@ -208,6 +209,200 @@ def _requires_method(obj, method_name, min_version):
     if _has_method(obj, method_name):
         return None
     return _err(f"{method_name} requires DaVinci Resolve {min_version}+")
+
+_MARKER_COLORS = [
+    "Blue", "Cyan", "Green", "Yellow", "Red", "Pink", "Purple", "Fuchsia",
+    "Rose", "Lavender", "Sky", "Mint", "Lemon", "Sand", "Cocoa", "Cream",
+]
+
+
+def _first_param(p: Dict[str, Any], *keys: str, default=None):
+    for key in keys:
+        if key in p and p[key] is not None:
+            return p[key]
+    return default
+
+
+def _normalize_marker_color(value):
+    raw = str(value if value is not None else "Blue").strip()
+    if not raw:
+        raw = "Blue"
+    for color in _MARKER_COLORS:
+        if raw.lower() == color.lower():
+            return color, None
+    return None, _err(f"Invalid marker color '{raw}'. Must be one of: {', '.join(_MARKER_COLORS)}")
+
+
+def _coerce_marker_number(value, field_name):
+    if isinstance(value, bool):
+        return None, _err(f"{field_name} must be a frame number, not a boolean")
+    if isinstance(value, int):
+        return value, None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value, None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None, _err(f"{field_name} cannot be empty")
+        try:
+            if "." in raw:
+                number = float(raw)
+                return int(number) if number.is_integer() else number, None
+            return int(raw), None
+        except ValueError:
+            return None, _err(f"{field_name} must be a frame number")
+    return None, _err(f"{field_name} must be a frame number")
+
+
+def _timeline_fps(tl):
+    try:
+        setting = tl.GetSetting("timelineFrameRate")
+    except Exception as exc:
+        return None, _err(f"Failed to read timelineFrameRate: {exc}")
+    match = re.search(r"\d+(?:\.\d+)?", str(setting or ""))
+    if not match:
+        return None, _err("Could not determine timeline frame rate")
+    return float(match.group(0)), None
+
+
+def _timecode_to_frame_id(timecode, fps):
+    if not isinstance(timecode, str):
+        return None, _err("timecode must be a string like '01:00:00:00'")
+    tc = timecode.strip()
+    drop_frame = ";" in tc
+    parts = tc.replace(";", ":").replace(".", ":").split(":")
+    if len(parts) != 4:
+        return None, _err("timecode must use HH:MM:SS:FF format")
+    try:
+        hours, minutes, seconds, frames = [int(part) for part in parts]
+    except ValueError:
+        return None, _err("timecode fields must be numeric")
+
+    nominal_fps = int(round(float(fps)))
+    if nominal_fps <= 0:
+        return None, _err("timeline frame rate must be greater than zero")
+    if hours < 0 or minutes < 0 or minutes > 59 or seconds < 0 or seconds > 59:
+        return None, _err("timecode hours must be non-negative, and minutes/seconds must be between 0 and 59")
+    if frames < 0 or frames >= nominal_fps:
+        return None, _err(f"timecode frame component must be between 0 and {nominal_fps - 1}")
+
+    total_frames = ((hours * 3600 + minutes * 60 + seconds) * nominal_fps) + frames
+    if drop_frame:
+        drop_frames = int(round(nominal_fps * 0.0666666667))
+        total_minutes = hours * 60 + minutes
+        total_frames -= drop_frames * (total_minutes - total_minutes // 10)
+    return total_frames, None
+
+
+def _timeline_timecode_to_frame_id(tl, timecode):
+    if tl is None:
+        return None, _err("timecode markers require a timeline")
+    fps, err = _timeline_fps(tl)
+    if err:
+        return None, err
+    return _timecode_to_frame_id(timecode, fps)
+
+
+def _current_timeline_frame_id(tl):
+    if tl is None:
+        return None, _err("current playhead marker requires a timeline")
+    try:
+        timecode = tl.GetCurrentTimecode()
+    except Exception as exc:
+        return None, _err(f"Failed to read current timeline timecode: {exc}")
+    if not timecode:
+        return None, _err("Current timeline timecode is unavailable")
+    return _timeline_timecode_to_frame_id(tl, timecode)
+
+
+def _marker_frame_from_params(p: Dict[str, Any], tl=None, default_to_current=False):
+    raw_timecode = _first_param(p, "timecode", "time_code", "tc")
+    if raw_timecode is not None:
+        return _timeline_timecode_to_frame_id(tl, raw_timecode)
+
+    raw_frame = _first_param(p, "frame", "frame_id", "frameId", "frame_num", "frameNum")
+    if raw_frame is not None:
+        if isinstance(raw_frame, str):
+            lowered = raw_frame.strip().lower()
+            if lowered in {"current", "playhead", "current_playhead", "now"}:
+                return _current_timeline_frame_id(tl)
+            if ":" in raw_frame or ";" in raw_frame:
+                return _timeline_timecode_to_frame_id(tl, raw_frame)
+        return _coerce_marker_number(raw_frame, "frame")
+
+    if default_to_current:
+        return _current_timeline_frame_id(tl)
+    return None, _err("Missing marker frame. Provide frame, frame_id/frameId, or timecode.")
+
+
+def _marker_add_payload(p: Dict[str, Any], tl=None, default_to_current=False):
+    frame, err = _marker_frame_from_params(p, tl=tl, default_to_current=default_to_current)
+    if err:
+        return None, err
+
+    color, err = _normalize_marker_color(_first_param(p, "color", default="Blue"))
+    if err:
+        return None, err
+
+    note = str(_first_param(p, "note", "comment", "description", default="") or "")
+    name = str(_first_param(p, "name", "label", default=(note or "Marker")) or "Marker")
+    duration, err = _coerce_marker_number(
+        _first_param(p, "duration", "duration_frames", "durationFrames", default=1),
+        "duration",
+    )
+    if err:
+        return None, err
+    if duration <= 0:
+        return None, _err("duration must be greater than zero")
+
+    return {
+        "frame": frame,
+        "color": color,
+        "name": name,
+        "note": note,
+        "duration": duration,
+        "custom_data": str(_first_param(p, "custom_data", "customData", default="") or ""),
+    }, None
+
+
+def _add_marker(target, marker: Dict[str, Any]):
+    try:
+        result = target.AddMarker(
+            marker["frame"],
+            marker["color"],
+            marker["name"],
+            marker["note"],
+            marker["duration"],
+            marker["custom_data"],
+        )
+    except TypeError as exc:
+        if marker["custom_data"]:
+            return _err(f"AddMarker failed: {exc}")
+        try:
+            result = target.AddMarker(
+                marker["frame"],
+                marker["color"],
+                marker["name"],
+                marker["note"],
+                marker["duration"],
+            )
+        except Exception as fallback_exc:
+            return _err(f"AddMarker failed: {fallback_exc}")
+    except Exception as exc:
+        return _err(f"AddMarker failed: {exc}")
+
+    out = {"success": bool(result), "frame": marker["frame"]}
+    if not result:
+        try:
+            markers = target.GetMarkers() or {}
+            frame_keys = {marker["frame"]}
+            if isinstance(marker["frame"], int):
+                frame_keys.add(float(marker["frame"]))
+            if any(frame_key in markers for frame_key in frame_keys):
+                out["reason"] = f"A marker already exists at frame {marker['frame']}"
+        except Exception:
+            pass
+    return out
 
 def _check():
     resolve = get_resolve()
@@ -1456,13 +1651,13 @@ def media_pool_item_markers(action: str, params: Optional[Dict[str, Any]] = None
     """Markers and flags on media pool clips. Identify clip by clip_id.
 
     Actions:
-      add(clip_id, frame, color, name, note, duration, custom_data?) -> {success}
+      add(clip_id, frame|frame_id|frameId, color?, name?, note?, duration?, custom_data?) -> {success, frame}
       get_all(clip_id) -> {markers}
       get_by_custom_data(clip_id, custom_data) -> {markers}
-      update_custom_data(clip_id, frame, custom_data) -> {success}
-      get_custom_data(clip_id, frame) -> {data}
+      update_custom_data(clip_id, frame|frame_id|frameId, custom_data) -> {success}
+      get_custom_data(clip_id, frame|frame_id|frameId) -> {data}
       delete_by_color(clip_id, color) -> {success}
-      delete_at_frame(clip_id, frame) -> {success}
+      delete_at_frame(clip_id, frame|frame_id|frameId) -> {success}
       delete_by_custom_data(clip_id, custom_data) -> {success}
       add_flag(clip_id, color) -> {success}
       get_flags(clip_id) -> {flags}
@@ -1481,21 +1676,33 @@ def media_pool_item_markers(action: str, params: Optional[Dict[str, Any]] = None
         return _err(f"Clip not found: {p.get('clip_id')}")
 
     if action == "add":
-        return {"success": bool(clip.AddMarker(p["frame"], p["color"], p["name"], p["note"], p["duration"], p.get("custom_data", "")))}
+        marker, marker_err = _marker_add_payload(p)
+        if marker_err:
+            return marker_err
+        return _add_marker(clip, marker)
     elif action == "get_all":
         return {"markers": _ser(clip.GetMarkers())}
     elif action == "get_by_custom_data":
-        return {"markers": _ser(clip.GetMarkerByCustomData(p["custom_data"]))}
+        return {"markers": _ser(clip.GetMarkerByCustomData(_first_param(p, "custom_data", "customData", default="")))}
     elif action == "update_custom_data":
-        return {"success": bool(clip.UpdateMarkerCustomData(p["frame"], p["custom_data"]))}
+        frame, frame_err = _marker_frame_from_params(p)
+        if frame_err:
+            return frame_err
+        return {"success": bool(clip.UpdateMarkerCustomData(frame, _first_param(p, "custom_data", "customData", default="")))}
     elif action == "get_custom_data":
-        return {"data": clip.GetMarkerCustomData(p["frame"])}
+        frame, frame_err = _marker_frame_from_params(p)
+        if frame_err:
+            return frame_err
+        return {"data": clip.GetMarkerCustomData(frame)}
     elif action == "delete_by_color":
         return {"success": bool(clip.DeleteMarkersByColor(p["color"]))}
     elif action == "delete_at_frame":
-        return {"success": bool(clip.DeleteMarkerAtFrame(p["frame"]))}
+        frame, frame_err = _marker_frame_from_params(p)
+        if frame_err:
+            return frame_err
+        return {"success": bool(clip.DeleteMarkerAtFrame(frame))}
     elif action == "delete_by_custom_data":
-        return {"success": bool(clip.DeleteMarkerByCustomData(p["custom_data"]))}
+        return {"success": bool(clip.DeleteMarkerByCustomData(_first_param(p, "custom_data", "customData", default="")))}
     elif action == "add_flag":
         return {"success": bool(clip.AddFlag(p["color"]))}
     elif action == "get_flags":
@@ -1772,13 +1979,14 @@ def timeline_markers(action: str, params: Optional[Dict[str, Any]] = None) -> Di
     """Markers and playhead operations on the current timeline.
 
     Actions:
-      add(frame, color, name, note, duration, custom_data?) -> {success}
+      add(frame|frame_id|frameId|timecode?, color?, name?, note?, duration?, custom_data?) -> {success, frame}
+        If frame/timecode is omitted, add uses the current playhead timecode.
       get_all() -> {markers}
       get_by_custom_data(custom_data) -> {markers}
-      update_custom_data(frame, custom_data) -> {success}
-      get_custom_data(frame) -> {data}
+      update_custom_data(frame|frame_id|frameId|timecode, custom_data) -> {success}
+      get_custom_data(frame|frame_id|frameId|timecode) -> {data}
       delete_by_color(color) -> {success}
-      delete_at_frame(frame) -> {success}
+      delete_at_frame(frame|frame_id|frameId|timecode) -> {success}
       delete_by_custom_data(custom_data) -> {success}
       get_current_timecode() -> {timecode}
       set_current_timecode(timecode) -> {success}
@@ -1791,21 +1999,33 @@ def timeline_markers(action: str, params: Optional[Dict[str, Any]] = None) -> Di
         return err
 
     if action == "add":
-        return {"success": bool(tl.AddMarker(p["frame"], p["color"], p["name"], p["note"], p["duration"], p.get("custom_data", "")))}
+        marker, marker_err = _marker_add_payload(p, tl=tl, default_to_current=True)
+        if marker_err:
+            return marker_err
+        return _add_marker(tl, marker)
     elif action == "get_all":
         return {"markers": _ser(tl.GetMarkers())}
     elif action == "get_by_custom_data":
-        return {"markers": _ser(tl.GetMarkerByCustomData(p["custom_data"]))}
+        return {"markers": _ser(tl.GetMarkerByCustomData(_first_param(p, "custom_data", "customData", default="")))}
     elif action == "update_custom_data":
-        return {"success": bool(tl.UpdateMarkerCustomData(p["frame"], p["custom_data"]))}
+        frame, frame_err = _marker_frame_from_params(p, tl=tl)
+        if frame_err:
+            return frame_err
+        return {"success": bool(tl.UpdateMarkerCustomData(frame, _first_param(p, "custom_data", "customData", default="")))}
     elif action == "get_custom_data":
-        return {"data": tl.GetMarkerCustomData(p["frame"])}
+        frame, frame_err = _marker_frame_from_params(p, tl=tl)
+        if frame_err:
+            return frame_err
+        return {"data": tl.GetMarkerCustomData(frame)}
     elif action == "delete_by_color":
         return {"success": bool(tl.DeleteMarkersByColor(p["color"]))}
     elif action == "delete_at_frame":
-        return {"success": bool(tl.DeleteMarkerAtFrame(p["frame"]))}
+        frame, frame_err = _marker_frame_from_params(p, tl=tl)
+        if frame_err:
+            return frame_err
+        return {"success": bool(tl.DeleteMarkerAtFrame(frame))}
     elif action == "delete_by_custom_data":
-        return {"success": bool(tl.DeleteMarkerByCustomData(p["custom_data"]))}
+        return {"success": bool(tl.DeleteMarkerByCustomData(_first_param(p, "custom_data", "customData", default="")))}
     elif action == "get_current_timecode":
         return {"timecode": tl.GetCurrentTimecode()}
     elif action == "set_current_timecode":
@@ -2097,13 +2317,13 @@ def timeline_item_markers(action: str, params: Optional[Dict[str, Any]] = None) 
     """Markers, flags, and clip color on timeline items. Identify by track_type, track_index, item_index.
 
     Actions:
-      add(frame, color, name, note, duration, custom_data?, ...) -> {success}
+      add(frame|frame_id|frameId, color?, name?, note?, duration?, custom_data?, ...) -> {success, frame}
       get_all(...) -> {markers}
       get_by_custom_data(custom_data, ...) -> {markers}
-      update_custom_data(frame, custom_data, ...) -> {success}
-      get_custom_data(frame, ...) -> {data}
+      update_custom_data(frame|frame_id|frameId, custom_data, ...) -> {success}
+      get_custom_data(frame|frame_id|frameId, ...) -> {data}
       delete_by_color(color, ...) -> {success}
-      delete_at_frame(frame, ...) -> {success}
+      delete_at_frame(frame|frame_id|frameId, ...) -> {success}
       delete_by_custom_data(custom_data, ...) -> {success}
       add_flag(color, ...) -> {success}
       get_flags(...) -> {flags}
@@ -2120,21 +2340,33 @@ def timeline_item_markers(action: str, params: Optional[Dict[str, Any]] = None) 
         return err
 
     if action == "add":
-        return {"success": bool(item.AddMarker(p["frame"], p["color"], p["name"], p["note"], p["duration"], p.get("custom_data", "")))}
+        marker, marker_err = _marker_add_payload(p)
+        if marker_err:
+            return marker_err
+        return _add_marker(item, marker)
     elif action == "get_all":
         return {"markers": _ser(item.GetMarkers())}
     elif action == "get_by_custom_data":
-        return {"markers": _ser(item.GetMarkerByCustomData(p["custom_data"]))}
+        return {"markers": _ser(item.GetMarkerByCustomData(_first_param(p, "custom_data", "customData", default="")))}
     elif action == "update_custom_data":
-        return {"success": bool(item.UpdateMarkerCustomData(p["frame"], p["custom_data"]))}
+        frame, frame_err = _marker_frame_from_params(p)
+        if frame_err:
+            return frame_err
+        return {"success": bool(item.UpdateMarkerCustomData(frame, _first_param(p, "custom_data", "customData", default="")))}
     elif action == "get_custom_data":
-        return {"data": item.GetMarkerCustomData(p["frame"])}
+        frame, frame_err = _marker_frame_from_params(p)
+        if frame_err:
+            return frame_err
+        return {"data": item.GetMarkerCustomData(frame)}
     elif action == "delete_by_color":
         return {"success": bool(item.DeleteMarkersByColor(p["color"]))}
     elif action == "delete_at_frame":
-        return {"success": bool(item.DeleteMarkerAtFrame(p["frame"]))}
+        frame, frame_err = _marker_frame_from_params(p)
+        if frame_err:
+            return frame_err
+        return {"success": bool(item.DeleteMarkerAtFrame(frame))}
     elif action == "delete_by_custom_data":
-        return {"success": bool(item.DeleteMarkerByCustomData(p["custom_data"]))}
+        return {"success": bool(item.DeleteMarkerByCustomData(_first_param(p, "custom_data", "customData", default="")))}
     elif action == "add_flag":
         return {"success": bool(item.AddFlag(p["color"]))}
     elif action == "get_flags":

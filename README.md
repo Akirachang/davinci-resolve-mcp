@@ -1,6 +1,6 @@
 # DaVinci Resolve MCP Server
 
-[![Version](https://img.shields.io/badge/version-2.3.3-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.3.4-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](#api-coverage)
 [![Tools](https://img.shields.io/badge/MCP%20Tools-27%20(328%20full)-blue.svg)](#server-modes)
 [![Tested](https://img.shields.io/badge/Live%20Tested-98.5%25-green.svg)](#test-results)
@@ -10,7 +10,19 @@
 
 A Model Context Protocol (MCP) server providing **complete coverage** of the DaVinci Resolve Scripting API. Connect AI assistants (Claude, Cursor, Windsurf) to DaVinci Resolve and control every aspect of your post-production workflow through natural language.
 
-### What's New in v2.3.3
+### What's New in v2.3.4
+
+Marker API hardening for Issue #34 — making the compound marker tools match the parameter shapes agents and users naturally send.
+
+**Marker parameter aliases fixed**: `timeline_markers`, `media_pool_item_markers`, and `timeline_item_markers` now accept `frame`, `frame_id`, and `frameId` consistently for add/get/update/delete operations. Marker lookup and delete paths also accept `customData` as an alias for `custom_data`.
+
+**Timeline marker ergonomics improved**: `timeline_markers(action="add")` can now add at the current playhead when no frame/timecode is provided, and also accepts explicit `timecode` input. Optional marker fields now have sensible defaults (`color="Blue"`, `name` from note or `"Marker"`, `note=""`, `duration=1`).
+
+**Resolve overload fallback**: marker creation first uses the documented six-argument `AddMarker(..., customData)` call, and falls back to the five-argument form when `customData` is empty and a Resolve build rejects the optional parameter.
+
+**Live Resolve validation**: verified against DaVinci Resolve Studio 20.3.2.9 with `tests/live_marker_validation.py`. The harness creates a disposable project, imports synthetic media, inserts a visible timeline generator, and live-tests timeline, media-pool-item, and timeline-item marker add/get/update/delete alias paths. A `--keep-open` mode leaves a marked timeline open for visual inspection.
+
+### v2.3.3
 
 Granular layer hardening — closing exposure gaps and dropped-dict-key bugs surfaced by an exhaustive parity audit of every documented Resolve scripting method against both server layers.
 
@@ -89,12 +101,12 @@ API parity sweep — closing documented overloads and dropped parameters that th
 - **Resolve 20.2.2 API sync** — added the 12 scripting methods introduced across Resolve 20.0-20.2.2, with compatibility guards so older Resolve builds return clear "requires Resolve 20.x" errors instead of crashing
 - **Resolve 20 live validation** — revalidated the new API surface against DaVinci Resolve Studio 20.3.2, bringing live-tested coverage to 331/336 methods (98.5%)
 - **Official scripting docs refreshed** — `docs/resolve_scripting_api.txt` now tracks the Resolve 20 scripting README bundled with the installed 20.3.2 developer package
-- **AI skill reference updated** — merged PR #30's `docs/SKILL.md` and updated it for the Resolve 20 method count, 354-tool granular server, version guards, and source media integrity guidance
+- **AI skill reference updated** — merged PR #30's `docs/SKILL.md` and updated it for the Resolve 20 method count, granular server, version guards, and source media integrity guidance
 - **Stale Resolve handle recovery** — both server modes now validate cached Resolve handles and reconnect cleanly after Resolve restarts or Project Manager transitions
 
 ### v2.2.0
 
-- **Granular server modularized internally** — `src/resolve_mcp_server.py` is now a thin entrypoint, with the 354-tool implementation split across `src/granular/resolve_control.py`, `project.py`, `timeline.py`, `timeline_item.py`, `media_pool.py`, `folder.py`, `media_pool_item.py`, `gallery.py`, `graph.py`, and `media_storage.py`
+- **Granular server modularized internally** — `src/resolve_mcp_server.py` is now a thin entrypoint, with the granular implementation split across `src/granular/resolve_control.py`, `project.py`, `timeline.py`, `timeline_item.py`, `media_pool.py`, `folder.py`, `media_pool_item.py`, `gallery.py`, `graph.py`, and `media_storage.py`
 - **Installer now emits env blocks for every generated stdio config** — standard `.mcp.json`, VS Code `.vscode/mcp.json`, Zed `context_servers`, and manual snippets now include `RESOLVE_SCRIPT_API`, `RESOLVE_SCRIPT_LIB`, and `PYTHONPATH`
 - **Windows Resolve 20.3 hardening** — on Windows, the installer also emits `PYTHONHOME` derived from the selected interpreter's base install so Resolve binds against the intended Python instead of a newer globally registered one
 - **Windows stdio transport hardening** — server entrypoints now run FastMCP through strict LF-only stdio wrappers to avoid client disconnects caused by platform newline translation in Windows pipes
@@ -249,7 +261,7 @@ The MCP server comes in two modes:
 | Mode | File | Tools | Best For |
 |------|------|-------|----------|
 | **Compound** (default) | `src/server.py` | 27 | Most users — fast, clean, low context usage |
-| **Full** | `src/resolve_mcp_server.py` | 354 | Power users who want one tool per API method |
+| **Full** | `src/resolve_mcp_server.py` | 328 | Power users who want one tool per API method |
 
 The compound server's `timeline_item` tool includes dedicated actions for common workflows:
 
@@ -264,7 +276,7 @@ The compound server's `timeline_item` tool includes dedicated actions for common
 
 The installer uses the compound server by default. To use the full server:
 ```bash
-python src/server.py --full    # Launch full 354-tool server
+python src/server.py --full    # Launch full 328-tool server
 # Or point your MCP config directly at src/resolve_mcp_server.py
 ```
 
@@ -816,7 +828,7 @@ davinci-resolve-mcp/
 ├── install.py                    # Universal installer (macOS/Windows/Linux)
 ├── src/
 │   ├── server.py                # Compound MCP server — 27 tools (default)
-│   ├── resolve_mcp_server.py    # Thin full-server entrypoint — 354 tools
+│   ├── resolve_mcp_server.py    # Thin full-server entrypoint — 328 tools
 │   ├── granular/                # Modular full-server implementation
 │   └── utils/                   # Platform detection, Resolve connection helpers
 ├── tests/                       # 5-phase live API test suite + Resolve 20 delta (331/331 pass)

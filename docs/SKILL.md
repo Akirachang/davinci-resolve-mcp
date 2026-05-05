@@ -24,7 +24,7 @@ but that first connection can take up to 60 seconds.
 | Mode | Entry point | Tool count | Use when |
 |---|---|---|---|
 | Compound (default) | `src/server.py` | 27 tools | Most workflows — keeps context lean |
-| Granular (full) | `src/server.py --full` | 354 tools | Power users needing one tool per API method |
+| Granular (full) | `src/server.py --full` | 328 tools | Power users needing one tool per API method |
 
 This skill document covers the **compound server** (the default). Each compound
 tool accepts an `action` string and an optional `params` object.
@@ -165,9 +165,12 @@ Key actions:
 
 **`timeline_markers`** — Markers and playhead on the current timeline.
 
-Key actions: `add(frame, color, name, note, duration)`, `get_all`,
+Key actions: `add(frame|frame_id|timecode?, color?, name?, note?, duration?)`, `get_all`,
 `get_current_timecode`, `set_current_timecode(timecode)`,
 `get_current_video_item`, `get_thumbnail`
+
+For `add`, omit `frame`/`timecode` to create the marker at the current playhead.
+The compound tool accepts `frame`, `frame_id`, and `frameId` aliases.
 
 Note: `get_thumbnail` returns raw pixel data from `GetCurrentClipThumbnailImage()`.
 The dictionary includes `data` (raw bytes as a Python bytes-like object),
@@ -375,6 +378,7 @@ media_pool(action="append_to_timeline", params={"clip_infos": [
 timeline(action="get_items", params={"track_type": "video", "index": 1})
 timeline_item(action="get_name", params={"track_type": "video", "track_index": 1, "item_index": 0})
 timeline_item(action="get_property", params={"track_type": "video", "track_index": 1, "item_index": 0})
+timeline_markers(action="add", params={"color": "Blue", "note": "Review this"})
 timeline_item_markers(action="add", params={"frame": 100, "color": "Blue", "name": "Review", "note": "Check this", "duration": 1, "track_type": "video", "track_index": 1, "item_index": 0})
 ```
 
