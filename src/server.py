@@ -2062,7 +2062,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
                         if 0 < gap <= gap_max:
                             max_handle = max(max_handle, gap)
             final_s = max(0, int(source_start) - int(max_handle))
-            final_e = int(source_end) + int(max_handle)
+            final_e = int(source_end) - 1 + int(max_handle)
             frame_ranges.setdefault(name, []).append([final_s, final_e])
             uid = clip.GetUniqueId()
             occurrences.append({
