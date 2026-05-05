@@ -1795,6 +1795,11 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
       get_items_in_track(track_type, track_index) -> {items}
       get_voice_isolation_state(track_index) -> {isEnabled, amount}
       set_voice_isolation_state(track_index, state) -> {success}
+      extract_source_frame_ranges(handles?, gap_max?, skip_extensions?) -> {timeline_name, frame_ranges, occurrences, ...}
+        — Same logic as Pr/extract_timeline_frames.py get_resolve_api_frames: all video clips on the
+        current timeline; clip name = basename of Media Pool File Path when set; skips audio extensions.
+        source_range_final and frame_ranges tuples are inclusive/inclusive endpoints per that script.
+        Default handles=24, gap_max=30. Use handles=0 for gap-only auto handles.
     """
     p = params or {}
     pm, proj, err = _check()
@@ -1967,7 +1972,122 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         if missing:
             return missing
         return {"success": bool(tl.SetVoiceIsolationState(p["track_index"], p["state"]))}
-    return _unknown(action, ["list","get_current","set_current","get_name","set_name","get_start_frame","get_end_frame","get_start_timecode","set_start_timecode","get_track_count","add_track","delete_track","get_track_sub_type","set_track_enable","get_track_enabled","set_track_lock","get_track_locked","get_track_name","set_track_name","get_items","delete_clips","set_clips_linked","duplicate","create_compound_clip","create_fusion_clip","import_into_timeline","export","get_setting","set_setting","insert_generator","insert_fusion_generator","insert_fusion_composition","insert_ofx_generator","insert_title","insert_fusion_title","get_unique_id","get_node_graph","get_media_pool_item","get_mark_in_out","set_mark_in_out","clear_mark_in_out","convert_to_stereo","get_items_in_track","get_voice_isolation_state","set_voice_isolation_state"])
+    elif action == "extract_source_frame_ranges":
+        p = params or {}
+        handles = int(p.get("handles", 24))
+        gap_max = int(p.get("gap_max", 30))
+        audio_ext = tuple(
+            x.lower() for x in p.get(
+                "skip_extensions",
+                (".wav", ".mp3", ".aiff", ".aac", ".m4a"),
+            )
+        )
+
+        def _ifr(v):
+            """Resolve sometimes returns None — skip clip if unset."""
+            if v is None:
+                return None
+            try:
+                return int(round(float(v)))
+            except (TypeError, ValueError):
+                return None
+
+        clip_rows = []
+        nvid = tl.GetTrackCount("video") or 0
+        for track_index in range(1, nvid + 1):
+            clips = tl.GetItemListInTrack("video", track_index) or []
+            for clip in clips:
+                name = clip.GetName() or ""
+                try:
+                    mpi = clip.GetMediaPoolItem()
+                    if mpi:
+                        fp = mpi.GetClipProperty("File Path")
+                        if fp:
+                            name = os.path.basename(str(fp).replace("\\", "/"))
+                except Exception:
+                    pass
+                low = name.lower()
+                if any(low.endswith(ext) for ext in audio_ext):
+                    continue
+                try:
+                    t_start = _ifr(clip.GetStart())
+                    t_end_excl = _ifr(clip.GetEnd())
+                    lo = _ifr(clip.GetLeftOffset())
+                    if lo is None and _has_method(clip, "GetSourceStartFrame"):
+                        lo = _ifr(clip.GetSourceStartFrame())
+                except Exception:
+                    continue
+                if t_start is None or t_end_excl is None or lo is None:
+                    continue
+                duration_tl = t_end_excl - t_start
+                if duration_tl < 0:
+                    continue
+                source_boundary = lo + duration_tl
+                timeline_end_inc = t_end_excl - 1
+                clip_rows.append({
+                    "clip": clip,
+                    "name": name,
+                    "track": track_index,
+                    "timeline_start": t_start,
+                    "timeline_end_inclusive": timeline_end_inc,
+                    "source_boundary": source_boundary,
+                    "offset": lo,
+                })
+        frame_ranges: Dict[str, List[List[int]]] = {}
+        occurrences = []
+        for row in clip_rows:
+            clip = row["clip"]
+            name = row["name"]
+            track_index = row["track"]
+            t_start = row["timeline_start"]
+            t_end_inc = row["timeline_end_inclusive"]
+            source_start = row["offset"]
+            source_end = row["source_boundary"]
+            clips_on_track = tl.GetItemListInTrack("video", track_index) or []
+            max_handle = handles
+            if handles == 0:
+                max_handle = 0
+                for other in clips_on_track:
+                    oe = _ifr(other.GetEnd())
+                    os_ = _ifr(other.GetStart())
+                    if oe is None or os_ is None:
+                        continue
+                    other_end_inc = oe - 1
+                    if other_end_inc < t_start:
+                        gap = t_start - other_end_inc - 1
+                        if 0 < gap <= gap_max:
+                            max_handle = max(max_handle, gap)
+                    if os_ > t_end_inc:
+                        gap = os_ - t_end_inc - 1
+                        if 0 < gap <= gap_max:
+                            max_handle = max(max_handle, gap)
+            final_s = max(0, int(source_start) - int(max_handle))
+            final_e = int(source_end) - 1 + int(max_handle)
+            frame_ranges.setdefault(name, []).append([final_s, final_e])
+            uid = clip.GetUniqueId()
+            occurrences.append({
+                "clip_name": name,
+                "timeline_item_id": "" if uid is None else str(uid),
+                "track": track_index,
+                "timeline_start": t_start,
+                "timeline_end_inclusive": t_end_inc,
+                "source_used_inclusive_end": source_end - 1,
+                "handle_frames_applied": max_handle,
+                "source_range_final": [final_s, final_e],
+            })
+        return _ok(
+            timeline_name=tl.GetName() or "",
+            handles_param=handles,
+            gap_max=gap_max,
+            clip_count=len(occurrences),
+            frame_ranges=frame_ranges,
+            occurrences=occurrences,
+            notes=(
+                "Same rules as Pr/extract_timeline_frames.py get_resolve_api_frames (video only, "
+                "current timeline). frame_ranges lists can be merged/overlapped per clip name."
+            ),
+        )
+    return _unknown(action, ["list","get_current","set_current","get_name","set_name","get_start_frame","get_end_frame","get_start_timecode","set_start_timecode","get_track_count","add_track","delete_track","get_track_sub_type","set_track_enable","get_track_enabled","set_track_lock","get_track_locked","get_track_name","set_track_name","get_items","delete_clips","set_clips_linked","duplicate","create_compound_clip","create_fusion_clip","import_into_timeline","export","get_setting","set_setting","insert_generator","insert_fusion_generator","insert_fusion_composition","insert_ofx_generator","insert_title","insert_fusion_title","get_unique_id","get_node_graph","get_media_pool_item","get_mark_in_out","set_mark_in_out","clear_mark_in_out","convert_to_stereo","get_items_in_track","get_voice_isolation_state","set_voice_isolation_state","extract_source_frame_ranges"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
