@@ -25,7 +25,7 @@ from pathlib import Path
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 # ─── Colors (disabled on Windows cmd without ANSI support) ────────────────────
 

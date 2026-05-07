@@ -10,7 +10,7 @@ Usage:
     python src/server.py --full       # Start the 328-tool granular server instead
 """
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 import base64
 import os
