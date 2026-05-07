@@ -82,7 +82,7 @@ if _py_ver >= (3, 13):
     logger.warning(
         f"Python {_py_ver[0]}.{_py_ver[1]} detected. DaVinci Resolve's scripting API "
         f"may not work with Python 3.13+. If scriptapp('Resolve') returns None, "
-        f"recreate the venv with Python 3.10–3.12."
+        f"recreate the venv with Python 3.10-3.12."
     )
 
 # ─── Resolve Connection (lazy) ───────────────────────────────────────────────
@@ -667,18 +667,199 @@ def _build_create_clip_info_dict(root, ci: Dict[str, Any], index: int):
     }, None
 
 
-def _serialize_appended_timeline_item(item, index: int):
+def _frame_int(v):
+    if v is None:
+        return None
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_timeline_item_id(item):
+    try:
+        get_unique_id = getattr(item, "GetUniqueId", None)
+        if callable(get_unique_id):
+            item_id = get_unique_id()
+            return None if item_id in (None, "") else str(item_id)
+    except Exception:
+        return None
+    return None
+
+
+def _safe_timeline_item_name(item):
+    try:
+        get_name = getattr(item, "GetName", None)
+        if callable(get_name):
+            name = get_name()
+            return None if name is None else str(name)
+    except Exception:
+        return None
+    return None
+
+
+def _safe_media_pool_item_id(mpi):
+    try:
+        get_unique_id = getattr(mpi, "GetUniqueId", None)
+        if callable(get_unique_id):
+            media_id = get_unique_id()
+            return None if media_id in (None, "") else str(media_id)
+    except Exception:
+        return None
+    return None
+
+
+def _timeline_item_source_start(item):
+    if _has_method(item, "GetSourceStartFrame"):
+        try:
+            source_start = _frame_int(item.GetSourceStartFrame())
+            if source_start is not None:
+                return source_start
+        except Exception:
+            pass
+    try:
+        return _frame_int(item.GetLeftOffset())
+    except Exception:
+        return None
+
+
+def _timeline_item_media_pool_item(item):
+    try:
+        return item.GetMediaPoolItem()
+    except Exception:
+        return None
+
+
+def _serialize_appended_timeline_item(item, index: int, *, allow_empty_timeline_item_id: bool = False):
     if not item:
         return None, _err(f"Failed to append clip_infos to timeline: missing timeline item at index {index}")
+    item_id = None
+    name = None
     try:
         item_id = item.GetUniqueId()
+    except Exception as exc:
+        if not allow_empty_timeline_item_id:
+            logger.warning(f"Invalid timeline item returned for clip_infos[{index}]: {exc}")
+            return None, _err(f"Failed to append clip_infos to timeline: invalid timeline item at index {index}")
+        logger.warning(f"Appended timeline item has no readable id for clip_infos[{index}]: {exc}")
+    try:
         name = item.GetName()
     except Exception as exc:
-        logger.warning(f"Invalid timeline item returned for clip_infos[{index}]: {exc}")
-        return None, _err(f"Failed to append clip_infos to timeline: invalid timeline item at index {index}")
+        if not allow_empty_timeline_item_id:
+            logger.warning(f"Invalid timeline item returned for clip_infos[{index}]: {exc}")
+            return None, _err(f"Failed to append clip_infos to timeline: invalid timeline item at index {index}")
+        logger.warning(f"Appended timeline item has no readable name for clip_infos[{index}]: {exc}")
     if not item_id:
+        if allow_empty_timeline_item_id:
+            return {"timeline_item_id": None, "name": None if name is None else str(name)}, None
         return None, _err(f"Failed to append clip_infos to timeline: missing timeline item id at index {index}")
-    return {"timeline_item_id": item_id, "name": name}, None
+    return {"timeline_item_id": str(item_id), "name": None if name is None else str(name)}, None
+
+
+def _append_clip_info_from_timeline_item(item, target_track_index: int, record_frame_offset: int):
+    """Build one MediaPool.AppendToTimeline clipInfo dict from a timeline item.
+
+    Same pool media and source trim as the item; record at GetStart()+record_frame_offset
+    on target_track_index. GetDuration() is preferred because Resolve's timeline
+    end position can be inclusive for clips created via positioned append.
+    """
+    try:
+        mpi = item.GetMediaPoolItem()
+    except Exception as exc:
+        return None, _err(f"GetMediaPoolItem failed: {exc}")
+    if not mpi:
+        return None, _err(
+            "Timeline item has no MediaPoolItem (generators / titles without pool media cannot use this)"
+        )
+    try:
+        t_start = _frame_int(item.GetStart())
+        t_end_excl = _frame_int(item.GetEnd())
+    except Exception as exc:
+        return None, _err(f"GetStart/GetEnd failed: {exc}")
+    if t_start is None or t_end_excl is None:
+        return None, _err("GetStart/GetEnd returned unset values")
+    duration_tl = None
+    if _has_method(item, "GetDuration"):
+        try:
+            duration_tl = _frame_int(item.GetDuration())
+        except Exception:
+            duration_tl = None
+    if duration_tl is None:
+        duration_tl = t_end_excl - t_start
+    if duration_tl <= 0:
+        return None, _err("invalid timeline duration")
+    source_start = _timeline_item_source_start(item)
+    if source_start is None:
+        return None, _err("could not read source trim (LeftOffset / GetSourceStartFrame)")
+    src_start = source_start
+    src_end_excl = src_start + duration_tl
+    record = t_start + int(record_frame_offset)
+    return {
+        "mediaPoolItem": mpi,
+        "startFrame": src_start,
+        "endFrame": src_end_excl,
+        "recordFrame": record,
+        "trackIndex": int(target_track_index),
+        "mediaType": 1,
+    }, None
+
+
+def _find_appended_timeline_item_summary(
+    tl,
+    *,
+    target_track_index: int,
+    record_frame: int,
+    duration: int,
+    source_media_pool_item,
+    source_timeline_item_id: Optional[str] = None,
+):
+    """Recover an appended item's id by scanning the target track after append.
+
+    Resolve can occasionally return a thin object from AppendToTimeline that
+    lacks GetUniqueId/GetName even though the edit succeeded. The timeline track
+    itself usually contains the real item handle immediately after the append.
+    """
+    source_media_id = _safe_media_pool_item_id(source_media_pool_item)
+    try:
+        items = tl.GetItemListInTrack("video", target_track_index) or []
+    except Exception:
+        return None
+    matches = []
+    for item in items:
+        item_id = _safe_timeline_item_id(item)
+        if source_timeline_item_id and item_id == source_timeline_item_id:
+            continue
+        try:
+            start = _frame_int(item.GetStart())
+            end = _frame_int(item.GetEnd())
+        except Exception:
+            continue
+        if start != record_frame or start is None or end is None:
+            continue
+        item_duration = None
+        if _has_method(item, "GetDuration"):
+            try:
+                item_duration = _frame_int(item.GetDuration())
+            except Exception:
+                item_duration = None
+        if item_duration is None:
+            item_duration = end - start
+        if item_duration != duration:
+            continue
+        item_mpi = _timeline_item_media_pool_item(item)
+        if source_media_id:
+            if _safe_media_pool_item_id(item_mpi) != source_media_id:
+                continue
+        elif item_mpi is not source_media_pool_item:
+            continue
+        matches.append(item)
+    if not matches:
+        return None
+    item = matches[-1]
+    return {
+        "timeline_item_id": _safe_timeline_item_id(item),
+        "name": _safe_timeline_item_name(item),
+    }
 
 
 def _ser(obj):
@@ -1775,6 +1956,11 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
       delete_clips(clip_ids, ripple?) -> {success}  — clip_ids: list of unique IDs
       set_clips_linked(clip_ids, linked) -> {success}
       duplicate(name?) -> {success, name}
+      duplicate_clips(clip_ids, target_track_index?, record_frame_offset?) -> {results, count}
+        — Video clips only. Re-places the same MediaPool media with the same source trim on the
+        current timeline (like Alt-drag) via AppendToTimeline. clip_ids: timeline item unique IDs
+        from get_items / get_current_video_item. target_track_index: 1-based video track; defaults to
+        each clip's current track. record_frame_offset: added to the clip's record start (default 0).
       create_compound_clip(clip_ids, info?) -> {success}
       create_fusion_clip(clip_ids) -> {success}
       import_into_timeline(path, options?) -> {success}
@@ -1895,6 +2081,94 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
     elif action == "duplicate":
         dup = tl.DuplicateTimeline(p.get("name", tl.GetName() + " Copy"))
         return _ok(name=dup.GetName()) if dup else _err("Failed to duplicate")
+    elif action == "duplicate_clips":
+        ids = p.get("clip_ids") or p.get("ids")
+        if not ids or not isinstance(ids, list):
+            return _err("duplicate_clips requires clip_ids (list of timeline item unique IDs)")
+        try:
+            offset = int(p.get("record_frame_offset", p.get("recordFrameOffset", 0)))
+        except (TypeError, ValueError):
+            return _err("record_frame_offset must be an integer")
+        target_raw = p.get("target_track_index", p.get("targetTrackIndex"))
+        mp = proj.GetMediaPool()
+        if not mp:
+            return _err("Failed to get MediaPool")
+        try:
+            video_track_count = int(tl.GetTrackCount("video") or 0)
+        except Exception:
+            video_track_count = 0
+        results: List[Dict[str, Any]] = []
+        for cid in ids:
+            sid = str(cid)
+            item = _find_timeline_item_by_id(tl, sid)
+            if not item:
+                results.append({"clip_id": sid, "success": False, "error": "timeline item not found"})
+                continue
+            try:
+                track_info = item.GetTrackTypeAndIndex()
+            except Exception as exc:
+                results.append({"clip_id": sid, "success": False, "error": f"GetTrackTypeAndIndex: {exc}"})
+                continue
+            if not track_info or len(track_info) < 2:
+                results.append({"clip_id": sid, "success": False, "error": "GetTrackTypeAndIndex returned empty"})
+                continue
+            tt = str(track_info[0]).lower()
+            if tt != "video":
+                results.append({
+                    "clip_id": sid,
+                    "success": False,
+                    "error": f"only video items supported (got {track_info[0]!r})",
+                })
+                continue
+            try:
+                src_track = int(track_info[1])
+            except (TypeError, ValueError):
+                results.append({"clip_id": sid, "success": False, "error": "invalid source track index"})
+                continue
+            try:
+                dest_track = int(target_raw) if target_raw is not None else src_track
+            except (TypeError, ValueError):
+                results.append({"clip_id": sid, "success": False, "error": "target_track_index must be an integer"})
+                continue
+            if dest_track < 1:
+                results.append({"clip_id": sid, "success": False, "error": "target_track_index must be >= 1"})
+                continue
+            if video_track_count and dest_track > video_track_count:
+                results.append({
+                    "clip_id": sid,
+                    "success": False,
+                    "error": f"target video track {dest_track} does not exist",
+                })
+                continue
+            info, ierr = _append_clip_info_from_timeline_item(item, dest_track, offset)
+            if ierr:
+                results.append({"clip_id": sid, "success": False, "error": ierr.get("error", str(ierr))})
+                continue
+            try:
+                out = mp.AppendToTimeline([info])
+            except Exception as exc:
+                results.append({"clip_id": sid, "success": False, "error": str(exc)})
+                continue
+            if not out or len(out) < 1:
+                results.append({"clip_id": sid, "success": False, "error": "AppendToTimeline returned no item"})
+                continue
+            ser, serr = _serialize_appended_timeline_item(out[0], 0, allow_empty_timeline_item_id=True)
+            if serr:
+                results.append({"clip_id": sid, "success": False, "error": serr.get("error", str(serr))})
+                continue
+            if not ser.get("timeline_item_id"):
+                recovered = _find_appended_timeline_item_summary(
+                    tl,
+                    target_track_index=dest_track,
+                    record_frame=int(info["recordFrame"]),
+                    duration=int(info["endFrame"]) - int(info["startFrame"]),
+                    source_media_pool_item=info["mediaPoolItem"],
+                    source_timeline_item_id=sid,
+                )
+                if recovered and recovered.get("timeline_item_id"):
+                    ser = recovered
+            results.append({"clip_id": sid, "success": True, **ser})
+        return {"results": results, "count": len(results)}
     elif action == "create_compound_clip":
         ids_set = set(p["clip_ids"])
         found = []
@@ -2089,7 +2363,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
                 "current timeline). frame_ranges lists can be merged/overlapped per clip name."
             ),
         )
-    return _unknown(action, ["list","get_current","set_current","get_name","set_name","get_start_frame","get_end_frame","get_start_timecode","set_start_timecode","get_track_count","add_track","delete_track","get_track_sub_type","set_track_enable","get_track_enabled","set_track_lock","get_track_locked","get_track_name","set_track_name","get_items","delete_clips","set_clips_linked","duplicate","create_compound_clip","create_fusion_clip","import_into_timeline","export","get_setting","set_setting","insert_generator","insert_fusion_generator","insert_fusion_composition","insert_ofx_generator","insert_title","insert_fusion_title","get_unique_id","get_node_graph","get_media_pool_item","get_mark_in_out","set_mark_in_out","clear_mark_in_out","convert_to_stereo","get_items_in_track","get_voice_isolation_state","set_voice_isolation_state","extract_source_frame_ranges"])
+    return _unknown(action, ["list","get_current","set_current","get_name","set_name","get_start_frame","get_end_frame","get_start_timecode","set_start_timecode","get_track_count","add_track","delete_track","get_track_sub_type","set_track_enable","get_track_enabled","set_track_lock","get_track_locked","get_track_name","set_track_name","get_items","delete_clips","set_clips_linked","duplicate","duplicate_clips","create_compound_clip","create_fusion_clip","import_into_timeline","export","get_setting","set_setting","insert_generator","insert_fusion_generator","insert_fusion_composition","insert_ofx_generator","insert_title","insert_fusion_title","get_unique_id","get_node_graph","get_media_pool_item","get_mark_in_out","set_mark_in_out","clear_mark_in_out","convert_to_stereo","get_items_in_track","get_voice_isolation_state","set_voice_isolation_state","extract_source_frame_ranges"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

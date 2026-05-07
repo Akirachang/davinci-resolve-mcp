@@ -75,7 +75,7 @@ Key behavioral notes for `script_plugin`:
 
 | Mode | Entry point | Tool count | Use when |
 |---|---|---|---|
-| Compound (default) | `src/server.py` | 27 tools | Most workflows — keeps context lean |
+| Compound (default) | `src/server.py` | 30 tools | Most workflows — keeps context lean |
 | Granular (full) | `src/server.py --full` | 328 tools | Power users needing one tool per API method |
 
 This skill document covers the **compound server** (the default). Each compound
@@ -209,6 +209,10 @@ Key actions:
 - `add_track(track_type, sub_type?)` / `delete_track(track_type, index)`
 - `get_items(track_type, index)` — items on a track
 - `delete_clips(clip_ids, ripple?)` — IDs are unique IDs from `get_items`
+- `duplicate_clips(clip_ids, target_track_index?, record_frame_offset?)` —
+  duplicate existing video timeline items by re-appending the same Media Pool
+  item with the same source trim; use `target_track_index` or a nonzero offset
+  to avoid placing the duplicate directly over the source item
 - `export(path, type, subtype?)` — type: `"AAF"`, `"EDL"`, `"FCPXML"`, `"DRT"`, etc.
 - `insert_generator(name)`, `insert_title(name)`, `insert_fusion_title(name)`
 - `get_mark_in_out`, `set_mark_in_out(mark_in, mark_out, type?)`
@@ -431,6 +435,9 @@ media_pool(action="append_to_timeline", params={"clip_infos": [
 
 ```
 timeline(action="get_items", params={"track_type": "video", "index": 1})
+timeline(action="duplicate_clips", params={
+  "clip_ids": ["<timeline-item-uuid>"], "target_track_index": 2, "record_frame_offset": 120
+})
 timeline_item(action="get_name", params={"track_type": "video", "track_index": 1, "item_index": 0})
 timeline_item(action="get_property", params={"track_type": "video", "track_index": 1, "item_index": 0})
 timeline_markers(action="add", params={"color": "Blue", "note": "Review this"})
