@@ -1,6 +1,6 @@
 # DaVinci Resolve MCP Server
 
-[![Version](https://img.shields.io/badge/version-2.5.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.6.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](#api-coverage)
 [![Tools](https://img.shields.io/badge/MCP%20Tools-30%20(328%20full)-blue.svg)](#server-modes)
 [![Tested](https://img.shields.io/badge/Live%20Tested-98.5%25-green.svg)](#test-results)
@@ -13,7 +13,39 @@ A Model Context Protocol (MCP) server providing **complete coverage** of the DaV
 Release/version procedure: see [docs/release-process.md](docs/release-process.md).
 Resolve developer package notes: [Workflow Integrations](docs/workflow-integrations.md), [OpenFX](docs/openfx-notes.md), [LUTs](docs/lut-notes.md), [Fusion Templates](docs/fusion-template-notes.md), [DCTL](docs/dctl-notes.md), [Codec Plugins](docs/codec-plugin-notes.md), [Fuse + DCTL Authoring (experimental)](docs/fuse-dctl-authoring.md), [Script Plugin Authoring + Conversational Lua/Python](docs/script-plugin-authoring.md).
 
-### What's New in v2.5.0
+### What's New in v2.6.0
+
+Timeline clip duplication — adding an Alt-drag-style helper for duplicating
+existing video timeline items without creating proxy media, renders, or source
+derivatives.
+
+**New `timeline.duplicate_clips` action**: `timeline(action="duplicate_clips")`
+duplicates video timeline items by re-appending the same Media Pool item with
+the same source trim via `MediaPool.AppendToTimeline([{clipInfo}])`. It accepts
+timeline item IDs from `timeline.get_items`, an optional
+`target_track_index`, and `record_frame_offset`; each result reports per-clip
+success and the duplicated timeline item ID when Resolve exposes or recovers it.
+
+**Resolve append-result hardening**: duplicate results now tolerate thin
+`AppendToTimeline` return objects that lack readable `GetUniqueId()` or
+`GetName()` methods, then scan the target video track to recover the real item
+handle. Bad inputs now return clean per-clip errors for non-video items,
+invalid offsets, and nonexistent target tracks.
+
+**Live-tested source trim semantics**: validation against Resolve Studio
+20.3.2.9 confirmed that positioned `AppendToTimeline` treats `endFrame` as an
+exclusive source boundary in this workflow. `duplicate_clips` now uses
+`TimelineItem.GetDuration()` and `GetSourceStartFrame()` where available, so
+the duplicate preserves the original duration and source start.
+
+**Validation**: added `tests/live_duplicate_clips_validation.py`, which creates
+a disposable project, imports synthetic media, places a trimmed clip, duplicates
+it to another track, verifies record frame/duration/source trim/media identity,
+checks the invalid-track error path, and deletes the project. Focused unit
+coverage now includes anonymous append objects, source-start preference,
+video-only `mediaType`, and target-track ID recovery.
+
+### v2.5.0
 
 Three new compound tools for *authoring and conversationally executing* Resolve extensions: Fusion Fuse plugins, DCTL color transforms, and Resolve-page Lua/Python scripts. Plus a documentation pass on six adjacent Resolve extension systems.
 
