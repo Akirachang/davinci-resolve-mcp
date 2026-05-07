@@ -17,6 +17,58 @@ DaVinci Resolve must be running with **Preferences > General > "External scripti
 using"** set to **Local**. The server auto-launches Resolve if it is not running,
 but that first connection can take up to 60 seconds.
 
+Workflow Integration plugins/scripts are a separate Resolve-hosted UI mechanism.
+They are not required for this MCP server, but `docs/workflow-integrations.md`
+summarizes when they are useful for optional in-Resolve panels, UIManager
+scripts, and render callback companions.
+
+OpenFX plugins are native C++ image-effect plugins, not an MCP control surface.
+Use `docs/openfx-notes.md` when diagnosing `insert_ofx_generator` failures or
+discussing optional OFX plugin development.
+
+LUT files are directly relevant to Color-page graph actions. Use
+`docs/lut-notes.md` when diagnosing `graph.set_lut` failures, validating `.cube`
+files, or explaining `project_settings.refresh_luts`.
+
+Fusion templates are relevant to Edit/Cut page insertion actions. Use
+`docs/fusion-template-notes.md` when diagnosing `insert_fusion_generator` or
+`insert_fusion_title` failures, template paths, `.setting` files, or `.drfx`
+bundles.
+
+DCTL files are programmable color transforms/effects adjacent to LUT and OpenFX
+workflows. Use `docs/dctl-notes.md` when diagnosing `.dctl`/`.dctle` discovery,
+ResolveFX DCTL plugin behavior, ACES DCTL IDT/ODT setup, or DCTL-as-LUT usage.
+
+Codec plugins are native IO encode plugins that extend Deliver-page render
+formats/codecs. Use `docs/codec-plugin-notes.md` when diagnosing missing custom
+render formats/codecs, `.dvcp.bundle` packaging, or IOPlugins install paths.
+
+The `fuse_plugin`, `dctl`, and `script_plugin` compound tools (v2.5.0+) write
+Fuse plugin source, DCTL files, and Lua/Python scripts into Resolve's install
+directories. They are *authoring* tools — every other tool in this server wraps
+Resolve's scripting API, while these three emit and install plugin/script
+source. Status: live-verified in DaVinci Resolve Studio 20.3.2.9 (templates
+register and the `text_overlay` Fuse + Python `run_inline` Resolve-API queries
+were confirmed working). Use `docs/fuse-dctl-authoring.md` for the Fuse + DCTL
+coverage matrix and `docs/script-plugin-authoring.md` for the script DSL spec
+and the conversational-execution model.
+
+Key behavioral notes for `script_plugin`:
+- `run_inline(source, language)` runs ad-hoc Lua/Python in Resolve and returns
+  stdout + result — use this for one-off conversational queries against the
+  Resolve API instead of building+installing a script.
+- `execute(name, category, language)` runs an installed script the same way.
+- Lua scripts: `fusion.Execute()` from the Python bridge is a no-op in
+  Resolve 20.x — `_run_inline_lua` works around this with `RunScript` against
+  a temp file plus completion-sentinel polling on `app:SetData/GetData`.
+- Fuse install path on macOS is `…/DaVinci Resolve/Fusion/Fuses/` (NOT
+  `Support/Fusion/Fuses/` as the SDK doc lists). The MCP path helpers handle
+  this; if you're staging files manually, use the path the implementation
+  emits.
+- Resolve picks up new scripts without a restart; new Fuses need a restart
+  to register; new DCTLs need `project_settings(action='refresh_luts')`
+  (regular LUT category) or a restart (ACES IDT/ODT category).
+
 ---
 
 ## Two Server Modes

@@ -2,7 +2,8 @@
 """
 DaVinci Resolve MCP Server (Compound Tools)
 
-27 compound tools covering 100% of the DaVinci Resolve Scripting API (336 methods).
+30 compound tools covering 100% of the DaVinci Resolve Scripting API (336 methods)
+plus Fusion Fuse, DCTL, and Resolve-page Script authoring tools.
 Each tool groups related operations via an 'action' parameter.
 
 Usage:
@@ -10,7 +11,7 @@ Usage:
     python src/server.py --full       # Start the 328-tool granular server instead
 """
 
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 
 import base64
 import os
@@ -22,7 +23,7 @@ import re
 import subprocess
 import tempfile
 import time
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 # ─── Path Setup ───────────────────────────────────────────────────────────────
 
@@ -37,7 +38,8 @@ for p in [current_dir, project_dir]:
 # Platform-specific Resolve paths
 from src.utils.cdl import normalize_cdl_payload
 from src.utils.mcp_stdio import run_fastmcp_stdio
-from src.utils.platform import get_resolve_paths
+from src.utils.platform import get_resolve_paths, get_resolve_plugin_paths
+from src.utils import fuse_templates, dctl_templates, script_templates
 
 paths = get_resolve_paths()
 RESOLVE_API_PATH = paths["api_path"]
@@ -3432,6 +3434,1031 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 28: fuse_plugin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Fusion's naming rule (Fuse SDK p. 40): identifiers must match this pattern,
+# else the resulting comp will save but fail to reopen.
+_FUSE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FUSE_MARKER = "@mcp-fuse"
+
+
+def _fuses_dir() -> str:
+    return get_resolve_plugin_paths()["fuses_dir"]
+
+
+def _validate_fuse_name(name: str) -> Optional[Dict[str, Any]]:
+    if not name or not _FUSE_NAME_RE.match(name):
+        return _err(f"Invalid Fuse name '{name}'. Must match [A-Za-z_][A-Za-z0-9_]* "
+                    "(Fuse SDK requirement; bad names produce comps that won't reopen).")
+    return None
+
+
+def _fuse_path(name: str) -> str:
+    return os.path.join(_fuses_dir(), f"{name}.fuse")
+
+
+def _validate_lua_syntax(source: str) -> Dict[str, Any]:
+    """Run `luac -p` if available. Returns {'valid': bool, 'errors': str|None,
+    'checker': 'luac'|'unavailable'}."""
+    luac = None
+    for candidate in ("luac", "luac5.1", "luac5.3", "luac5.4"):
+        try:
+            subprocess.run([candidate, "-v"], capture_output=True, check=True, timeout=5)
+            luac = candidate
+            break
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            continue
+    if luac is None:
+        return {"valid": True, "errors": None, "checker": "unavailable"}
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".lua", delete=False) as f:
+        f.write(source)
+        tmp = f.name
+    try:
+        result = subprocess.run([luac, "-p", tmp], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return {"valid": True, "errors": None, "checker": luac}
+        return {"valid": False, "errors": result.stderr.strip() or result.stdout.strip(),
+                "checker": luac}
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _validate_glsl_minimal(source: str) -> Dict[str, Any]:
+    """Cheap GLSL sanity check — verifies the required ShadePixel signature is
+    present and braces balance. Real GLSL validation needs glslangValidator,
+    which isn't bundled with Resolve."""
+    if "ShadePixel" not in source:
+        return {"valid": False, "errors": "Missing required `void ShadePixel(inout FuPixel f)`",
+                "checker": "minimal"}
+    if source.count("{") != source.count("}"):
+        return {"valid": False, "errors": "Unbalanced braces in shader source.",
+                "checker": "minimal"}
+    return {"valid": True, "errors": None, "checker": "minimal"}
+
+
+@mcp.tool()
+def fuse_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Author and install Fusion Fuse plugins (.fuse files).
+
+    Fuses are Lua plugins (or GLSL view-LUT shaders) that Fusion loads at
+    startup. A NEW Fuse requires a Resolve restart to register; existing Fuses
+    can be edited and reloaded from the Inspector's Edit/Reload buttons without
+    restart. The MCP cannot trigger reload — that's a UI-only action.
+
+    Actions:
+      path() -> {fuses_dir}
+      list() -> {fuses}  — Fuses with the @mcp-fuse marker comment.
+      list(all=true) -> {fuses}  — All .fuse files in the directory.
+      install(name, source, overwrite?) -> {success, path}
+        — name: [A-Za-z_][A-Za-z0-9_]*
+        — source: full Fuse source (Lua, or Lua+GLSL for view LUTs)
+        — overwrite: bool (default false)
+      remove(name) -> {success}
+      read(name) -> {source}
+      validate(source, type?) -> {valid, errors, checker}
+        — type: 'lua' (default) | 'glsl'
+      template(kind, name, options?) -> {source, kind, name}
+        — Returns generated source. Pass it to install() to write to disk.
+        — kind: one of the keys returned by list_templates(). See
+          docs/fuse-dctl-authoring.md for the per-kind option spec.
+      list_templates() -> {kinds}
+    """
+    p = params or {}
+
+    if action == "path":
+        return {"fuses_dir": _fuses_dir()}
+
+    if action == "list_templates":
+        return {"kinds": sorted(fuse_templates.TEMPLATES.keys())}
+
+    if action == "list":
+        d = _fuses_dir()
+        if not os.path.isdir(d):
+            return {"fuses": []}
+        show_all = bool(p.get("all", False))
+        out = []
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".fuse"):
+                continue
+            full = os.path.join(d, fn)
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    head = f.read(512)
+            except OSError:
+                continue
+            mcp_managed = _FUSE_MARKER in head
+            if show_all or mcp_managed:
+                out.append({"name": fn[:-5], "path": full, "mcp_managed": mcp_managed})
+        return {"fuses": out}
+
+    if action == "install":
+        name = p.get("name", "")
+        invalid = _validate_fuse_name(name)
+        if invalid:
+            return invalid
+        source = p.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return _err("install requires a non-empty 'source' string.")
+        d = _fuses_dir()
+        os.makedirs(d, exist_ok=True)
+        path = _fuse_path(name)
+        if os.path.exists(path) and not p.get("overwrite", False):
+            return _err(f"Fuse '{name}' already exists at {path}. "
+                        "Pass overwrite=true to replace it.")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(source)
+        except OSError as e:
+            return _err(f"Failed to write Fuse: {e}")
+        return _ok(path=path,
+                   note="Restart DaVinci Resolve to register a new Fuse. "
+                        "Existing Fuses can be reloaded via the Inspector.")
+
+    if action == "remove":
+        name = p.get("name", "")
+        invalid = _validate_fuse_name(name)
+        if invalid:
+            return invalid
+        path = _fuse_path(name)
+        if not os.path.isfile(path):
+            return _err(f"No Fuse named '{name}' at {path}")
+        try:
+            os.unlink(path)
+        except OSError as e:
+            return _err(f"Failed to remove Fuse: {e}")
+        return _ok(path=path)
+
+    if action == "read":
+        name = p.get("name", "")
+        invalid = _validate_fuse_name(name)
+        if invalid:
+            return invalid
+        path = _fuse_path(name)
+        if not os.path.isfile(path):
+            return _err(f"No Fuse named '{name}' at {path}")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return {"source": f.read(), "path": path}
+        except OSError as e:
+            return _err(f"Failed to read Fuse: {e}")
+
+    if action == "validate":
+        source = p.get("source")
+        if not isinstance(source, str):
+            return _err("validate requires a 'source' string.")
+        kind = p.get("type", "lua")
+        if kind == "glsl":
+            return _validate_glsl_minimal(source)
+        return _validate_lua_syntax(source)
+
+    if action == "template":
+        kind = p.get("kind", "")
+        name = p.get("name", "")
+        invalid = _validate_fuse_name(name)
+        if invalid:
+            return invalid
+        gen = fuse_templates.TEMPLATES.get(kind)
+        if gen is None:
+            return _err(f"Unknown template kind '{kind}'. Valid: "
+                        f"{sorted(fuse_templates.TEMPLATES.keys())}")
+        try:
+            source = gen(name, p.get("options"))
+        except (ValueError, KeyError, TypeError) as e:
+            return _err(f"Template generation failed: {e}")
+        return {"source": source, "kind": kind, "name": name}
+
+    return _unknown(action, ["path", "list", "install", "remove", "read",
+                             "validate", "template", "list_templates"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 29: dctl
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Fuse identifier rules don't apply to DCTL filenames, but we still want safe
+# filesystem names. Disallow path separators and shell-hostile characters.
+_DCTL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ \-]{0,127}$")
+_DCTL_MARKER = "@mcp-dctl"
+_DCTL_VALID_EXT = (".dctl", ".dctle")
+
+
+def _dctl_dir(category: str = "lut") -> str:
+    """Return the install root for a given DCTL category.
+
+    'lut'      → regular LUT folder, picked up by RefreshLUTList()
+    'aces_idt' → ACES Transforms/IDT, scanned only at Resolve startup
+    'aces_odt' → ACES Transforms/ODT, scanned only at Resolve startup
+    """
+    paths = get_resolve_plugin_paths()
+    if category == "lut":
+        return paths["dctl_dir"]
+    if category == "aces_idt":
+        return paths["aces_idt_dir"]
+    if category == "aces_odt":
+        return paths["aces_odt_dir"]
+    raise ValueError(f"Unknown DCTL category '{category}'. "
+                     "Valid: lut, aces_idt, aces_odt")
+
+
+def _validate_dctl_name(name: str) -> Optional[Dict[str, Any]]:
+    if not name or not _DCTL_NAME_RE.match(name):
+        return _err(f"Invalid DCTL name '{name}'. "
+                    "Must match [A-Za-z0-9_][A-Za-z0-9_ \\-]{0,127}.")
+    return None
+
+
+def _resolve_dctl_subdir(subdir: Optional[str]) -> Optional[str]:
+    """Validate a subdir string and return it as a normalized POSIX-style path
+    relative segment. Returns None for no subdir, or raises ValueError."""
+    if not subdir:
+        return None
+    if "\\" in subdir:
+        subdir = subdir.replace("\\", "/")
+    parts = [p.strip() for p in subdir.split("/") if p.strip()]
+    if not parts:
+        return None
+    for p in parts:
+        if p in (".", "..") or "/" in p or "\\" in p:
+            raise ValueError(f"Unsafe subdir segment: '{p}'")
+        if p.startswith("."):
+            raise ValueError(f"Hidden subdir not allowed: '{p}'")
+    return os.path.join(*parts)
+
+
+def _dctl_path(name: str, subdir: Optional[str] = None,
+               ext: str = ".dctl", category: str = "lut") -> str:
+    sd = _resolve_dctl_subdir(subdir)
+    root = _dctl_dir(category)
+    base = root if sd is None else os.path.join(root, sd)
+    return os.path.join(base, f"{name}{ext}")
+
+
+def _validate_dctl_source(source: str) -> Dict[str, Any]:
+    """Lightweight DCTL sanity check.
+
+    Verifies a transform() or transition() entry point is present, brace
+    balance is intact, and warns about float literals missing the `f` suffix
+    (a common cause of unhelpful build errors per docs/dctl-notes.md).
+    """
+    warnings = []
+    has_transform = "transform(" in source and "__DEVICE__" in source
+    has_transition = "transition(" in source and "TRANSITION_PROGRESS" in source
+    if not (has_transform or has_transition):
+        return {"valid": False,
+                "errors": "Missing __DEVICE__ transform() or transition() entry point.",
+                "warnings": warnings, "checker": "minimal"}
+    if source.count("{") != source.count("}"):
+        return {"valid": False, "errors": "Unbalanced braces.",
+                "warnings": warnings, "checker": "minimal"}
+    # Find decimal literals without an 'f' suffix in C-like contexts. This is
+    # a heuristic, not a parser — it skips lines starting with // and lines
+    # inside DEFINE_UI_PARAMS where Python-style numbers are also accepted.
+    import re as _re
+    suspicious = _re.compile(r"(?<![A-Za-z_0-9])[0-9]+\.[0-9]+(?![fA-Za-z_0-9])")
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("//") or stripped.startswith("DEFINE_UI"):
+            continue
+        if "transform" in stripped or "transition" in stripped:
+            # Header lines have type names like "float p_R", not numeric literals.
+            continue
+        for m in suspicious.finditer(line):
+            warnings.append(f"line {lineno}: float literal '{m.group(0)}' "
+                            "is missing 'f' suffix (DCTL requires '1.2f').")
+    return {"valid": True, "errors": None, "warnings": warnings,
+            "checker": "minimal"}
+
+
+_DCTL_VALID_CATEGORIES = ("lut", "aces_idt", "aces_odt")
+
+
+@mcp.tool()
+def dctl(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Author and install DCTL files (Color page custom shaders + ACES transforms).
+
+    Regular DCTLs live under Resolve's LUT directory and appear as LUT-style
+    entries in the LUT browser, the Clip/Node LUT picker, and the ResolveFX
+    DCTL plugin. After install, call project_settings(action='refresh_luts')
+    to make Resolve pick up the new file.
+
+    ACES DCTLs (IDT/ODT) live in a separate ACES Transforms directory tree
+    and are scanned only at Resolve startup — install requires a Resolve
+    restart, NOT a LUT refresh.
+
+    See docs/dctl-notes.md for the full spec and docs/fuse-dctl-authoring.md
+    for the experimental-tools coverage matrix.
+
+    Actions:
+      path(category?, subdir?) -> {dctl_dir}
+        — category: 'lut' (default) | 'aces_idt' | 'aces_odt'
+      list(category?, subdir?, all?) -> {files}
+        — Default: only files with @mcp-dctl marker. Pass all=true for everything.
+      install(name, source, category?, subdir?, ext?, overwrite?) -> {success, path}
+        — name: filesystem-safe identifier
+        — source: DCTL source as a string
+        — category: 'lut' (default) | 'aces_idt' | 'aces_odt'
+        — subdir: optional folder under the install root
+        — ext: '.dctl' (default) or '.dctle' (encrypted)
+      remove(name, category?, subdir?, ext?) -> {success}
+      read(name, category?, subdir?, ext?) -> {source, encrypted}
+      validate(source) -> {valid, errors, warnings, checker}
+      template(kind, name, options?) -> {source, kind, name, suggested_category}
+        — kind: 'transform' | 'transform_alpha' | 'transition' | 'matrix' |
+                'kernel' | 'lut_apply' | 'aces_idt' | 'aces_odt'
+        — `aces_*` kinds set suggested_category to 'aces_idt'/'aces_odt';
+          pass that as the `category` argument to install().
+      list_templates() -> {kinds, kind_categories}
+    """
+    p = params or {}
+
+    def _category(default: str = "lut") -> Tuple[Optional[Dict[str, Any]], str]:
+        cat = p.get("category", default)
+        if cat not in _DCTL_VALID_CATEGORIES:
+            return _err(f"Invalid category '{cat}'. "
+                        f"Valid: {list(_DCTL_VALID_CATEGORIES)}"), default
+        return None, cat
+
+    if action == "path":
+        err, cat = _category()
+        if err:
+            return err
+        try:
+            normalized = _resolve_dctl_subdir(p.get("subdir"))
+        except ValueError as e:
+            return _err(str(e))
+        root = _dctl_dir(cat)
+        out = root if normalized is None else os.path.join(root, normalized)
+        return {"dctl_dir": out, "category": cat}
+
+    if action == "list_templates":
+        return {
+            "kinds": sorted(dctl_templates.TEMPLATES.keys()),
+            "kind_categories": dict(dctl_templates.KIND_CATEGORY),
+        }
+
+    if action == "list":
+        err, cat = _category()
+        if err:
+            return err
+        try:
+            sd = _resolve_dctl_subdir(p.get("subdir"))
+        except ValueError as e:
+            return _err(str(e))
+        root = _dctl_dir(cat)
+        root = root if sd is None else os.path.join(root, sd)
+        if not os.path.isdir(root):
+            return {"files": []}
+        show_all = bool(p.get("all", False))
+        out = []
+        for fn in sorted(os.listdir(root)):
+            if not fn.lower().endswith(_DCTL_VALID_EXT):
+                continue
+            full = os.path.join(root, fn)
+            mcp_managed = False
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    head = f.read(512)
+                mcp_managed = _DCTL_MARKER in head
+            except OSError:
+                continue
+            if show_all or mcp_managed:
+                out.append({"name": os.path.splitext(fn)[0], "ext": os.path.splitext(fn)[1],
+                            "path": full, "mcp_managed": mcp_managed,
+                            "category": cat})
+        return {"files": out}
+
+    if action == "install":
+        name = p.get("name", "")
+        invalid = _validate_dctl_name(name)
+        if invalid:
+            return invalid
+        source = p.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return _err("install requires a non-empty 'source' string.")
+        ext = p.get("ext", ".dctl")
+        if ext not in _DCTL_VALID_EXT:
+            return _err(f"ext must be one of {list(_DCTL_VALID_EXT)}")
+        err, cat = _category()
+        if err:
+            return err
+        try:
+            sd = _resolve_dctl_subdir(p.get("subdir"))
+        except ValueError as e:
+            return _err(str(e))
+        root = _dctl_dir(cat)
+        target_dir = root if sd is None else os.path.join(root, sd)
+        os.makedirs(target_dir, exist_ok=True)
+        path = os.path.join(target_dir, f"{name}{ext}")
+        if os.path.exists(path) and not p.get("overwrite", False):
+            return _err(f"DCTL '{name}{ext}' already exists at {path}. "
+                        "Pass overwrite=true to replace it.")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(source)
+        except OSError as e:
+            return _err(f"Failed to write DCTL: {e}")
+        if cat == "lut":
+            note = ("Call project_settings(action='refresh_luts') to make "
+                    "Resolve pick up the new DCTL.")
+        else:
+            note = ("ACES DCTLs are scanned only at Resolve startup. "
+                    "Restart Resolve before this transform appears.")
+        return _ok(path=path, category=cat, note=note)
+
+    if action == "remove":
+        name = p.get("name", "")
+        invalid = _validate_dctl_name(name)
+        if invalid:
+            return invalid
+        ext = p.get("ext", ".dctl")
+        if ext not in _DCTL_VALID_EXT:
+            return _err(f"ext must be one of {list(_DCTL_VALID_EXT)}")
+        err, cat = _category()
+        if err:
+            return err
+        try:
+            sd = _resolve_dctl_subdir(p.get("subdir"))
+        except ValueError as e:
+            return _err(str(e))
+        target = _dctl_path(name, sd, ext, cat)
+        if not os.path.isfile(target):
+            return _err(f"No DCTL named '{name}{ext}' at {target}")
+        try:
+            os.unlink(target)
+        except OSError as e:
+            return _err(f"Failed to remove DCTL: {e}")
+        return _ok(path=target)
+
+    if action == "read":
+        name = p.get("name", "")
+        invalid = _validate_dctl_name(name)
+        if invalid:
+            return invalid
+        ext = p.get("ext", ".dctl")
+        if ext not in _DCTL_VALID_EXT:
+            return _err(f"ext must be one of {list(_DCTL_VALID_EXT)}")
+        err, cat = _category()
+        if err:
+            return err
+        try:
+            sd = _resolve_dctl_subdir(p.get("subdir"))
+        except ValueError as e:
+            return _err(str(e))
+        target = _dctl_path(name, sd, ext, cat)
+        if not os.path.isfile(target):
+            return _err(f"No DCTL named '{name}{ext}' at {target}")
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as f:
+                src = f.read()
+        except OSError as e:
+            return _err(f"Failed to read DCTL: {e}")
+        return {"source": src, "path": target,
+                "encrypted": ext == ".dctle", "category": cat}
+
+    if action == "validate":
+        source = p.get("source")
+        if not isinstance(source, str):
+            return _err("validate requires a 'source' string.")
+        return _validate_dctl_source(source)
+
+    if action == "template":
+        kind = p.get("kind", "")
+        name = p.get("name", "")
+        invalid = _validate_dctl_name(name)
+        if invalid:
+            return invalid
+        gen = dctl_templates.TEMPLATES.get(kind)
+        if gen is None:
+            return _err(f"Unknown template kind '{kind}'. Valid: "
+                        f"{sorted(dctl_templates.TEMPLATES.keys())}")
+        try:
+            source = gen(name, p.get("options"))
+        except (ValueError, KeyError, TypeError) as e:
+            return _err(f"Template generation failed: {e}")
+        return {
+            "source": source, "kind": kind, "name": name,
+            "suggested_category": dctl_templates.KIND_CATEGORY.get(kind, "lut"),
+        }
+
+    return _unknown(action, ["path", "list", "install", "remove", "read",
+                             "validate", "template", "list_templates"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 30: script_plugin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Resolve-page Lua/Python scripts must be filesystem-safe identifiers.
+_SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ \-]{0,127}$")
+_SCRIPT_MARKER = "@mcp-script"
+_SCRIPT_VALID_LANG = ("lua", "py")
+_SCRIPT_LANG_EXT = {"lua": ".lua", "py": ".py"}
+
+
+def _scripts_dir(category: str) -> str:
+    paths = get_resolve_plugin_paths()
+    valid = paths["scripts_categories"]
+    if category not in valid:
+        raise ValueError(f"Invalid category '{category}'. Valid: {list(valid)}")
+    return os.path.join(paths["scripts_root"], category)
+
+
+def _validate_script_name(name: str) -> Optional[Dict[str, Any]]:
+    if not name or not _SCRIPT_NAME_RE.match(name):
+        return _err(f"Invalid script name '{name}'. "
+                    "Must match [A-Za-z0-9_][A-Za-z0-9_ \\-]{0,127}.")
+    return None
+
+
+def _validate_script_language(language: str) -> Optional[Dict[str, Any]]:
+    if language not in _SCRIPT_VALID_LANG:
+        return _err(f"Invalid language '{language}'. "
+                    f"Valid: {list(_SCRIPT_VALID_LANG)}")
+    return None
+
+
+def _script_path(name: str, category: str, language: str) -> str:
+    return os.path.join(_scripts_dir(category), f"{name}{_SCRIPT_LANG_EXT[language]}")
+
+
+def _validate_script_source(source: str, language: str) -> Dict[str, Any]:
+    """Cheap syntax check. Lua → luac -p if available; Python → compile()."""
+    if language == "py":
+        try:
+            compile(source, "<script>", "exec")
+            return {"valid": True, "errors": None, "checker": "python-compile"}
+        except SyntaxError as e:
+            return {"valid": False,
+                    "errors": f"line {e.lineno}: {e.msg}",
+                    "checker": "python-compile"}
+    # Lua
+    return _validate_lua_syntax(source)
+
+
+# ─── Script execution ─────────────────────────────────────────────────────────
+
+def _python_env_for_resolve() -> Dict[str, str]:
+    """Build env vars so a Python subprocess can import DaVinciResolveScript."""
+    env = os.environ.copy()
+    env["RESOLVE_SCRIPT_API"] = RESOLVE_API_PATH
+    env["RESOLVE_SCRIPT_LIB"] = RESOLVE_LIB_PATH
+    pp = env.get("PYTHONPATH", "")
+    if RESOLVE_MODULES_PATH not in pp:
+        env["PYTHONPATH"] = (RESOLVE_MODULES_PATH +
+                             (os.pathsep + pp if pp else ""))
+    return env
+
+
+def _execute_python_script(path: str, args: List[str],
+                            timeout: int) -> Dict[str, Any]:
+    # Ensure Resolve is running so the script can connect.
+    get_resolve()
+    cmd = [sys.executable, path] + [str(a) for a in args]
+    try:
+        result = subprocess.run(cmd, env=_python_env_for_resolve(),
+                                 capture_output=True, text=True,
+                                 timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return _err(f"Script timed out after {timeout}s. "
+                    f"Partial stdout: {(e.stdout or '')[:1000]}")
+    except OSError as e:
+        return _err(f"Failed to launch Python subprocess: {e}")
+    return {
+        "success": result.returncode == 0,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exit_code": result.returncode,
+        "language": "py",
+    }
+
+
+def _execute_lua_script(path: str) -> Dict[str, Any]:
+    r = get_resolve()
+    if r is None:
+        return _err("Cannot run Lua script — Resolve isn't running and "
+                    "auto-launch failed.")
+    fusion = r.Fusion()
+    if fusion is None:
+        return _err("handle.Fusion() returned None — cannot run Lua scripts.")
+    try:
+        success = bool(fusion.RunScript(path))
+    except Exception as e:
+        return _err(f"Lua RunScript failed: {e}")
+    return {
+        "success": success,
+        "language": "lua",
+        "output_note": ("Lua print() output goes to Resolve's "
+                        "Workspace → Console → Lua tab. The MCP cannot capture "
+                        "Lua stdout. Use the Console to see what the script printed."),
+    }
+
+
+def _run_inline_python(source: str, timeout: int) -> Dict[str, Any]:
+    """Write source to a temp file, run it, return captured output.
+
+    Prepends a boilerplate header that connects to Resolve and exposes
+    `resolve`, `project`, `mp`, `timeline` as globals — same shape as the
+    scaffold template, so inline snippets feel like a REPL.
+    """
+    boilerplate = (
+        "import sys\n"
+        "import DaVinciResolveScript as dvr_script\n"
+        "resolve = dvr_script.scriptapp('Resolve')\n"
+        "project = (resolve.GetProjectManager().GetCurrentProject()\n"
+        "           if resolve else None)\n"
+        "mp = project.GetMediaPool() if project else None\n"
+        "timeline = project.GetCurrentTimeline() if project else None\n"
+        "\n"
+    )
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py',
+                                      delete=False, encoding='utf-8') as f:
+        f.write(boilerplate)
+        f.write(source)
+        tmp = f.name
+    try:
+        return _execute_python_script(tmp, [], timeout)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _run_inline_lua(source: str) -> Dict[str, Any]:
+    """Run a Lua snippet inside Resolve's Fusion engine.
+
+    Implementation note: Fusion's `Execute()` is effectively a no-op from the
+    Python bridge in Resolve 20.x — it runs without propagating return values
+    or side effects observable from Python. `RunScript()` against a file path
+    DOES work and gives the script full access to the standard Lua context
+    (`fu`, `fusion`, `app`, `bmd`, `io`, `os`, ...). We bridge results back
+    via `app:SetData(key, value)` which IS visible from Python's
+    `fusion.GetData(key)`.
+
+    The wrapper captures `print()` output into a string and stores stdout,
+    return value, and any pcall error in three Fusion-app SetData slots that
+    the Python side reads after RunScript returns.
+    """
+    r = get_resolve()
+    if r is None:
+        return _err("Cannot run Lua — Resolve isn't running and auto-launch failed.")
+    fusion = r.Fusion()
+    if fusion is None:
+        return _err("handle.Fusion() returned None — cannot run inline Lua.")
+
+    wrapped = (
+        'local _mcp_stdout = {}\n'
+        'local _mcp_orig_print = print\n'
+        'print = function(...)\n'
+        '    local args = {...}\n'
+        '    local parts = {}\n'
+        '    for i, v in ipairs(args) do parts[i] = tostring(v) end\n'
+        '    table.insert(_mcp_stdout, table.concat(parts, "\\t"))\n'
+        'end\n'
+        'local _mcp_ok, _mcp_result = pcall(function()\n'
+        + source + '\n'
+        'end)\n'
+        'print = _mcp_orig_print\n'
+        'local _mcp_app = fu or fusion or app\n'
+        'if _mcp_app then\n'
+        '    _mcp_app:SetData("__mcp_stdout__", table.concat(_mcp_stdout, "\\n"))\n'
+        '    if _mcp_ok then\n'
+        '        _mcp_app:SetData("__mcp_result__",\n'
+        '            _mcp_result ~= nil and tostring(_mcp_result) or "")\n'
+        '        _mcp_app:SetData("__mcp_error__", "")\n'
+        '    else\n'
+        '        _mcp_app:SetData("__mcp_result__", "")\n'
+        '        _mcp_app:SetData("__mcp_error__", tostring(_mcp_result))\n'
+        '    end\n'
+        '    _mcp_app:SetData("__mcp_done__", "1")\n'  # completion sentinel
+        'end\n'
+    )
+
+    # Clear prior slots so we can detect if RunScript silently did nothing.
+    fusion.SetData("__mcp_done__", "")
+    fusion.SetData("__mcp_stdout__", "")
+    fusion.SetData("__mcp_result__", "")
+    fusion.SetData("__mcp_error__", "")
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.lua',
+                                      prefix='mcp-lua-inline-',
+                                      delete=False, encoding='utf-8') as tf:
+        tf.write(wrapped)
+        tmp = tf.name
+
+    try:
+        try:
+            fusion.RunScript(tmp)
+        except Exception as e:
+            return _err(f"Lua RunScript failed: {e}")
+
+        # RunScript is async — poll the completion sentinel until set.
+        deadline = time.time() + 60
+        while fusion.GetData("__mcp_done__") != "1":
+            if time.time() > deadline:
+                return _err("Lua run_inline timed out after 60s waiting for "
+                            "the script to complete.")
+            time.sleep(0.1)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    stdout = fusion.GetData("__mcp_stdout__") or ""
+    result = fusion.GetData("__mcp_result__") or ""
+    error = fusion.GetData("__mcp_error__") or ""
+
+    response: Dict[str, Any] = {
+        "success": not error,
+        "stdout": stdout + ("\n" if stdout and not stdout.endswith("\n") else ""),
+        "language": "lua",
+    }
+    if result:
+        response["result"] = result
+    if error:
+        response["error"] = error
+    return response
+
+
+@mcp.tool()
+def script_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Author and install Resolve-page Lua/Python scripts (Workspace → Scripts menu).
+
+    Scripts live under the per-category subdirs of Resolve's Fusion/Scripts/
+    directory and appear automatically in Workspace → Scripts → <category>
+    on the page that matches the category. Resolve picks up new scripts
+    without a restart — the menu refreshes the next time it's opened.
+
+    Categories: 'Edit', 'Color', 'Deliver', 'Comp', 'Tool', 'Utility', 'Views'.
+    'Utility' shows up everywhere; the rest only on the matching page.
+
+    Two template kinds:
+      - 'scaffold'    minimal stub with Resolve handle setup
+      - 'media_rules' rules-and-variables DSL (declarative VARIABLES + RULES
+                       interpreted by an embedded engine; supports sources,
+                       extract patterns, transforms, targets, actions,
+                       conditions, dry-run, external CSV/JSON data, fuzzy
+                       matching, and per-rule metadata)
+
+    Both languages (Lua and Python) generate fully self-contained scripts.
+
+    See docs/script-plugin-authoring.md for the DSL spec.
+
+    Actions:
+      path(category) -> {scripts_dir}
+      categories() -> {categories}
+      list(category?, all?, language?) -> {scripts}
+      install(name, source, category, language?, overwrite?) -> {success, path}
+      remove(name, category, language) -> {success}
+      read(name, category, language) -> {source}
+      validate(source, language?) -> {valid, errors, checker}
+      template(kind, name, options?) -> {source, kind, name, language}
+        — kind: 'scaffold' | 'media_rules'
+        — options: {language: 'lua'|'py', ...kind-specific}
+      list_templates() -> {kinds}
+      execute(name, category, language, args?, timeout?) -> {success, stdout?, stderr?, exit_code?}
+        — Python: subprocess with stdout/stderr captured.
+        — Lua: fusion.RunScript(); print() output goes to Resolve Console.
+        — args: list of CLI args for the Python subprocess (Python only).
+        — timeout: seconds (default 120 for execute, 60 for run_inline).
+        — Auto-launches Resolve if not running.
+      run_inline(source, language, timeout?) -> {success, stdout?, stderr?, result?}
+        — Python: writes to temp file with `resolve`/`project`/`mp`/`timeline`
+          pre-bound, runs as subprocess, captures stdout/stderr.
+        — Lua: fusion.Execute(source); return value comes back as `result`.
+        — Use this for ad-hoc one-shot queries without persisting a file.
+    """
+    p = params or {}
+
+    if action == "categories":
+        paths = get_resolve_plugin_paths()
+        return {"categories": list(paths["scripts_categories"])}
+
+    if action == "list_templates":
+        return {"kinds": sorted(script_templates.TEMPLATES.keys())}
+
+    if action == "path":
+        category = p.get("category")
+        if not category:
+            return _err("path requires a 'category' argument.")
+        try:
+            return {"scripts_dir": _scripts_dir(category), "category": category}
+        except ValueError as e:
+            return _err(str(e))
+
+    if action == "list":
+        category = p.get("category")
+        language_filter = p.get("language")
+        if language_filter and language_filter not in _SCRIPT_VALID_LANG:
+            return _err(f"Invalid language '{language_filter}'. "
+                        f"Valid: {list(_SCRIPT_VALID_LANG)}")
+        show_all = bool(p.get("all", False))
+
+        paths = get_resolve_plugin_paths()
+        if category:
+            try:
+                roots = [(category, _scripts_dir(category))]
+            except ValueError as e:
+                return _err(str(e))
+        else:
+            roots = [(c, os.path.join(paths["scripts_root"], c))
+                     for c in paths["scripts_categories"]]
+
+        out = []
+        for cat, root in roots:
+            if not os.path.isdir(root):
+                continue
+            for fn in sorted(os.listdir(root)):
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in (".lua", ".py"):
+                    continue
+                lang = "lua" if ext == ".lua" else "py"
+                if language_filter and lang != language_filter:
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    with open(full, "r", encoding="utf-8", errors="replace") as f:
+                        head = f.read(512)
+                except OSError:
+                    continue
+                mcp_managed = _SCRIPT_MARKER in head
+                if show_all or mcp_managed:
+                    out.append({
+                        "name": os.path.splitext(fn)[0],
+                        "language": lang,
+                        "category": cat,
+                        "path": full,
+                        "mcp_managed": mcp_managed,
+                    })
+        return {"scripts": out}
+
+    if action == "install":
+        name = p.get("name", "")
+        invalid = _validate_script_name(name)
+        if invalid:
+            return invalid
+        source = p.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return _err("install requires a non-empty 'source' string.")
+        category = p.get("category")
+        if not category:
+            return _err("install requires a 'category'.")
+        language = p.get("language", "lua")
+        invalid = _validate_script_language(language)
+        if invalid:
+            return invalid
+        try:
+            target_dir = _scripts_dir(category)
+        except ValueError as e:
+            return _err(str(e))
+        os.makedirs(target_dir, exist_ok=True)
+        path = os.path.join(target_dir, f"{name}{_SCRIPT_LANG_EXT[language]}")
+        if os.path.exists(path) and not p.get("overwrite", False):
+            return _err(f"Script '{name}{_SCRIPT_LANG_EXT[language]}' already "
+                        f"exists at {path}. Pass overwrite=true to replace it.")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(source)
+        except OSError as e:
+            return _err(f"Failed to write script: {e}")
+        return _ok(path=path, category=category, language=language,
+                   note="Resolve picks up new scripts without a restart. "
+                        "Open Workspace → Scripts → " + category +
+                        " to run.")
+
+    if action == "remove":
+        name = p.get("name", "")
+        invalid = _validate_script_name(name)
+        if invalid:
+            return invalid
+        category = p.get("category")
+        if not category:
+            return _err("remove requires a 'category'.")
+        language = p.get("language", "lua")
+        invalid = _validate_script_language(language)
+        if invalid:
+            return invalid
+        try:
+            target = _script_path(name, category, language)
+        except ValueError as e:
+            return _err(str(e))
+        if not os.path.isfile(target):
+            return _err(f"No script named '{name}{_SCRIPT_LANG_EXT[language]}' at {target}")
+        try:
+            os.unlink(target)
+        except OSError as e:
+            return _err(f"Failed to remove script: {e}")
+        return _ok(path=target)
+
+    if action == "read":
+        name = p.get("name", "")
+        invalid = _validate_script_name(name)
+        if invalid:
+            return invalid
+        category = p.get("category")
+        if not category:
+            return _err("read requires a 'category'.")
+        language = p.get("language", "lua")
+        invalid = _validate_script_language(language)
+        if invalid:
+            return invalid
+        try:
+            target = _script_path(name, category, language)
+        except ValueError as e:
+            return _err(str(e))
+        if not os.path.isfile(target):
+            return _err(f"No script named '{name}{_SCRIPT_LANG_EXT[language]}' at {target}")
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                return {"source": f.read(), "path": target,
+                        "language": language, "category": category}
+        except OSError as e:
+            return _err(f"Failed to read script: {e}")
+
+    if action == "validate":
+        source = p.get("source")
+        if not isinstance(source, str):
+            return _err("validate requires a 'source' string.")
+        language = p.get("language", "lua")
+        invalid = _validate_script_language(language)
+        if invalid:
+            return invalid
+        return _validate_script_source(source, language)
+
+    if action == "template":
+        kind = p.get("kind", "")
+        name = p.get("name", "")
+        invalid = _validate_script_name(name)
+        if invalid:
+            return invalid
+        gen = script_templates.TEMPLATES.get(kind)
+        if gen is None:
+            return _err(f"Unknown template kind '{kind}'. Valid: "
+                        f"{sorted(script_templates.TEMPLATES.keys())}")
+        opts = p.get("options") or {}
+        language = opts.get("language", "lua")
+        invalid = _validate_script_language(language)
+        if invalid:
+            return invalid
+        try:
+            source = gen(name, opts)
+        except (ValueError, KeyError, TypeError) as e:
+            return _err(f"Template generation failed: {e}")
+        return {"source": source, "kind": kind, "name": name,
+                "language": language}
+
+    if action == "execute":
+        name = p.get("name", "")
+        invalid = _validate_script_name(name)
+        if invalid:
+            return invalid
+        category = p.get("category")
+        if not category:
+            return _err("execute requires a 'category'.")
+        language = p.get("language", "lua")
+        invalid = _validate_script_language(language)
+        if invalid:
+            return invalid
+        timeout = int(p.get("timeout", 120))
+        try:
+            target = _script_path(name, category, language)
+        except ValueError as e:
+            return _err(str(e))
+        if not os.path.isfile(target):
+            return _err(f"No script named '{name}{_SCRIPT_LANG_EXT[language]}' "
+                        f"at {target}")
+        if language == "py":
+            args = p.get("args", [])
+            if not isinstance(args, list):
+                return _err("'args' must be a list of strings.")
+            return _execute_python_script(target, args, timeout)
+        return _execute_lua_script(target)
+
+    if action == "run_inline":
+        source = p.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return _err("run_inline requires a non-empty 'source' string.")
+        language = p.get("language", "lua")
+        invalid = _validate_script_language(language)
+        if invalid:
+            return invalid
+        timeout = int(p.get("timeout", 60))
+        if language == "py":
+            return _run_inline_python(source, timeout)
+        return _run_inline_lua(source)
+
+    return _unknown(action, ["path", "categories", "list", "install", "remove",
+                             "read", "validate", "template", "list_templates",
+                             "execute", "run_inline"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Server Startup
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -3445,5 +4472,5 @@ if __name__ == "__main__":
         run_fastmcp_stdio(granular_mcp)
         sys.exit(0)
 
-    logger.info(f"Starting DaVinci Resolve MCP Server (27 compound tools)")
+    logger.info(f"Starting DaVinci Resolve MCP Server (30 compound tools)")
     run_fastmcp_stdio(mcp)
