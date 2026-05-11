@@ -211,6 +211,49 @@ def _err(msg):
 def _ok(**kw):
     return {"success": True, **kw}
 
+
+def _summarize_folder(folder, *, include_clips: bool, clip_limit: int, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursive Media Pool folder summary with a shared clip-budget across the tree."""
+    try:
+        clips_all = folder.GetClipList() or []
+    except Exception:
+        clips_all = []
+    try:
+        subs_all = folder.GetSubFolderList() or []
+    except Exception:
+        subs_all = []
+    try:
+        folder_id = folder.GetUniqueId()
+    except Exception:
+        folder_id = None
+    result: Dict[str, Any] = {
+        "name": folder.GetName() or "",
+        "id": folder_id,
+        "clip_count": len(clips_all),
+        "subfolder_count": len(subs_all),
+        "subfolders": [],
+    }
+    if include_clips:
+        remaining = max(0, clip_limit - state["used"])
+        if remaining < len(clips_all):
+            state["truncated"] = True
+            included = clips_all[:remaining]
+        else:
+            included = clips_all
+        result["clips"] = []
+        for c in included:
+            try:
+                cid = c.GetUniqueId()
+            except Exception:
+                cid = None
+            result["clips"].append({"name": c.GetName() or "", "id": cid})
+        state["used"] += len(included)
+    for sub in subs_all:
+        result["subfolders"].append(
+            _summarize_folder(sub, include_clips=include_clips, clip_limit=clip_limit, state=state)
+        )
+    return result
+
 def _has_method(obj, method_name):
     return callable(getattr(obj, method_name, None))
 
@@ -926,6 +969,15 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
       quit() -> {success}
       get_fairlight_presets() -> {presets}
       set_high_priority() -> {success}
+      project_summary(include_clips?=False, clip_limit?=200) -> {product, version, page,
+                                                                 project, timelines, media_pool, truncated}
+        — One-shot snapshot of the loaded project so the model doesn't need ~10 read calls
+          to figure out "what's in the room". Returns product/version/current-page, the active
+          project's name+id+frame-rate+resolution, the full timeline list with a per-timeline
+          track_counts dict and an is_current flag, and the media pool's root-folder tree with
+          per-folder clip_count + subfolder_count. include_clips=True additionally lists clip
+          names + ids per folder; clip_limit caps the total across the entire pool. truncated
+          is True when the cap was hit.
     """
     p = params or {}
 
@@ -963,7 +1015,91 @@ def resolve_control(action: str, params: Optional[Dict[str, Any]] = None) -> Dic
         return {"presets": _ser(r.GetFairlightPresets())}
     elif action == "set_high_priority":
         return {"success": bool(r.SetHighPriority())}
-    return _unknown(action, ["launch","get_version","get_page","open_page","get_keyframe_mode","set_keyframe_mode","quit","get_fairlight_presets","set_high_priority"])
+    elif action == "project_summary":
+        include_clips = bool(p.get("include_clips", False))
+        try:
+            clip_limit = int(p.get("clip_limit", 200))
+        except (TypeError, ValueError):
+            clip_limit = 200
+        if clip_limit < 1:
+            clip_limit = 200
+
+        pm, proj, err = _check()
+        if err:
+            return err
+
+        cur_tl = proj.GetCurrentTimeline()
+        try:
+            cur_id = cur_tl.GetUniqueId() if cur_tl else None
+        except Exception:
+            cur_id = None
+
+        timelines = []
+        try:
+            tl_count = int(proj.GetTimelineCount() or 0)
+        except (TypeError, ValueError):
+            tl_count = 0
+        for i in range(1, tl_count + 1):
+            t = proj.GetTimelineByIndex(i)
+            if t is None:
+                continue
+            try:
+                t_id = t.GetUniqueId()
+            except Exception:
+                t_id = None
+            timelines.append({
+                "name": t.GetName() or "",
+                "id": t_id,
+                "is_current": (t_id is not None and t_id == cur_id),
+                "start_frame": t.GetStartFrame(),
+                "end_frame": t.GetEndFrame(),
+                "track_counts": {
+                    "video": t.GetTrackCount("video") or 0,
+                    "audio": t.GetTrackCount("audio") or 0,
+                    "subtitle": t.GetTrackCount("subtitle") or 0,
+                },
+            })
+
+        state = {"used": 0, "truncated": False}
+        media_pool_summary = None
+        mp = proj.GetMediaPool()
+        if mp:
+            root = mp.GetRootFolder()
+            if root:
+                cur_folder = mp.GetCurrentFolder()
+                try:
+                    cur_folder_id = cur_folder.GetUniqueId() if cur_folder else None
+                except Exception:
+                    cur_folder_id = None
+                media_pool_summary = {
+                    "root_folder": _summarize_folder(
+                        root, include_clips=include_clips, clip_limit=clip_limit, state=state,
+                    ),
+                    "current_folder_id": cur_folder_id,
+                }
+
+        def _maybe_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return v
+
+        return _ok(
+            product=r.GetProductName(),
+            version=r.GetVersionString(),
+            page=r.GetCurrentPage(),
+            project={
+                "name": proj.GetName(),
+                "id": proj.GetUniqueId(),
+                "frame_rate": proj.GetSetting("timelineFrameRate"),
+                "resolution_width": _maybe_int(proj.GetSetting("timelineResolutionWidth")),
+                "resolution_height": _maybe_int(proj.GetSetting("timelineResolutionHeight")),
+            },
+            timelines=timelines,
+            media_pool=media_pool_summary,
+            truncated=state["truncated"],
+        )
+    return _unknown(action, ["launch","get_version","get_page","open_page","get_keyframe_mode","set_keyframe_mode","quit","get_fairlight_presets","set_high_priority","project_summary"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
