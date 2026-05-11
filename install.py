@@ -25,7 +25,7 @@ from pathlib import Path
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 
 # ─── Colors (disabled on Windows cmd without ANSI support) ────────────────────
 
@@ -67,12 +67,15 @@ def platform_name():
 RESOLVE_PATHS = {
     "Darwin": {
         "api": [
+            "/Applications/DaVinci Resolve Studio.app/Contents/Resources/Developer/Scripting",
             "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting",
         ],
         "lib": [
+            "/Applications/DaVinci Resolve Studio.app/Contents/Libraries/Fusion/fusionscript.so",
             "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so",
         ],
         "app": [
+            "/Applications/DaVinci Resolve Studio.app",
             "/Applications/DaVinci Resolve/DaVinci Resolve.app",
         ],
     },

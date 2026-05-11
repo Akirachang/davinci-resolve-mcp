@@ -1,8 +1,8 @@
 # DaVinci Resolve MCP Server
 
-[![Version](https://img.shields.io/badge/version-2.6.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.7.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](#api-coverage)
-[![Tools](https://img.shields.io/badge/MCP%20Tools-30%20(328%20full)-blue.svg)](#server-modes)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-31%20(328%20full)-blue.svg)](#server-modes)
 [![Tested](https://img.shields.io/badge/Live%20Tested-98.5%25-green.svg)](#test-results)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5+-darkred.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![Python](https://img.shields.io/badge/python-3.10--3.12-green.svg)](https://www.python.org/downloads/)
@@ -13,7 +13,53 @@ A Model Context Protocol (MCP) server providing **complete coverage** of the DaV
 Release/version procedure: see [docs/release-process.md](docs/release-process.md).
 Resolve developer package notes: [Workflow Integrations](docs/workflow-integrations.md), [OpenFX](docs/openfx-notes.md), [LUTs](docs/lut-notes.md), [Fusion Templates](docs/fusion-template-notes.md), [DCTL](docs/dctl-notes.md), [Codec Plugins](docs/codec-plugin-notes.md), [Fuse + DCTL Authoring (experimental)](docs/fuse-dctl-authoring.md), [Script Plugin Authoring + Conversational Lua/Python](docs/script-plugin-authoring.md).
 
-### What's New in v2.6.0
+### What's New in v2.7.0
+
+Vision for the model — a new `frames` compound tool extracts small thumbnail
+JPEGs from clips or the timeline and returns them as MCP `Image` content blocks
+so vision-capable models (Claude, etc.) can actually *see* the footage they
+are editing instead of reasoning blindly over clip names and durations.
+
+**New `frames` compound tool**: four actions covering the practical "show me
+what's in this clip" loop.
+- `extract_from_clip(clip_id, count? | timestamps_seconds? | frame_numbers? | interval_seconds?, max_dimension?=512, format?='jpg', return_images?=True, cleanup?=True, max_count?=32)` — extract thumbnails from a Media Pool clip's source media via ffmpeg. Default: 8 evenly spaced frames across the clip.
+- `extract_thumbnails(clip_ids, count_per_clip?=3, max_dimension?=384, return_images?=True, cleanup?=True)` — bulk thumbnail browser across multiple clips for "review my A-rolls" workflows.
+- `extract_from_timeline(start_seconds?, end_seconds?, count?=8 | every_n_seconds? | timestamps_seconds?, max_dimension?=512, return_images?=True, cleanup?=True)` — captures graded timeline output via `Project.ExportCurrentFrameAsStill`, then ffmpeg-downscales for token efficiency. Slower than source-clip extraction but reflects the actual graded look.
+- `check_ffmpeg()` — diagnostic for the ffmpeg dependency.
+
+**Vision-by-default**: when `return_images=True` (default), the tool returns a
+mixed list with metadata + one MCP `Image` content block per frame, so the
+host (Claude, etc.) attaches them as viewable images on the response. Set
+`return_images=False` to receive only file paths plus metadata for downstream
+non-visual processing.
+
+**Token-efficient defaults**: `max_dimension=512` for single-clip extraction,
+`max_dimension=384` for bulk thumbnails, JPEG quality 3, frame count
+hard-capped at 32 per call. Tuned to give the model enough visual signal to
+make editing decisions without blowing out context.
+
+**Source-vs-graded boundary made explicit**: source-media extraction reads the
+original file directly with ffmpeg (fast, ungraded — good for reviewing what's
+in raw A-roll). Timeline extraction goes through Resolve's
+`ExportCurrentFrameAsStill` so the model sees the graded output (slower; use
+when reviewing finals, color decisions, or composite results).
+
+**New optional dependency**: `ffmpeg` on PATH. Install via Homebrew
+(`brew install ffmpeg`), apt, or https://ffmpeg.org/download.html. The
+`frames` tool returns a clear install hint if it can't find ffmpeg; all other
+tools are unaffected.
+
+**Validation**: 33 hermetic unit tests in `tests/test_frame_extraction.py`
+covering format normalization, scale-filter generation, frame-selection logic
+across all four input modes, fps/duration parsing, ffmpeg invocation shape, and
+input-validation paths on the compound tool. Live harness
+`tests/live_frames_validation.py` creates a disposable project with two
+synthetic ffmpeg-generated clips and exercises every action plus error paths;
+also verifies that `return_images=True` produces MCP `Image` blocks.
+
+**Compound tool count: 30 → 31**. Granular tool count unchanged at 328.
+
+### v2.6.0
 
 Timeline clip duplication — adding an Alt-drag-style helper for duplicating
 existing video timeline items without creating proxy media, renders, or source

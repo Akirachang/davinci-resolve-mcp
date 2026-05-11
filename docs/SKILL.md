@@ -393,6 +393,59 @@ Key actions: `add_job`, `list_jobs`, `delete_job(job_id)`, `delete_all_jobs`,
 
 ---
 
+### Vision (v2.7.0+)
+
+**`frames`** — Extract small thumbnail frames from clips or the timeline so a
+vision-capable model can actually *see* the footage. By default returns MCP
+`Image` content blocks; set `return_images=False` to receive only file paths
+plus metadata.
+
+Source-clip extraction (`extract_from_clip`, `extract_thumbnails`) requires
+`ffmpeg` on PATH and reads the original media file directly — fast, ungraded.
+Timeline extraction (`extract_from_timeline`) drives Resolve's
+`Project.ExportCurrentFrameAsStill` — slow (~1–2s per frame) but applies the
+current grade and timeline effects.
+
+Actions:
+- `check_ffmpeg` — diagnostic; returns `{available, path, version, error?}`
+- `extract_from_clip(clip_id, *, count?=8 | timestamps_seconds? | frame_numbers? | interval_seconds?, max_dimension?=512, format?='jpg', output_dir?, return_images?=True, cleanup?=True, max_count?=32)`
+  - Provide ONE of `count`, `timestamps_seconds`, `frame_numbers`,
+    `interval_seconds`. Default: 8 evenly spaced frames across the clip.
+- `extract_from_timeline(*, start_seconds?, end_seconds?, count?=8 | every_n_seconds? | timestamps_seconds?, max_dimension?=512, format?='jpg', output_dir?, return_images?=True, cleanup?=True)`
+  - Captures graded timeline output. Switch to the Color page first for
+    consistent results.
+- `extract_thumbnails(clip_ids, *, count_per_clip?=3, max_dimension?=384, format?='jpg', output_dir?, return_images?=True, cleanup?=True)`
+  - Bulk thumbnail browser across multiple clips. Useful as a first step
+    when reviewing imported A-roll/B-roll.
+
+Practical recipe — "show me what's in these clips so I can pick which to use":
+
+```
+frames(action="extract_thumbnails",
+       params={"clip_ids": [<id1>, <id2>, ...], "count_per_clip": 3})
+# Claude receives 3 thumbnails per clip + metadata, can name what's in each
+```
+
+Practical recipe — "find the action in this 5-minute clip":
+
+```
+frames(action="extract_from_clip",
+       params={"clip_id": "...", "interval_seconds": 10})
+# 30 frames at 10s intervals (capped at max_count=32);
+# Claude reasons over the visual sequence and emits frame_numbers to cut on
+```
+
+Notes:
+- `max_dimension` is the longest edge in pixels. Defaults are tuned for token
+  efficiency: 512 for single-clip, 384 for bulk thumbnails. Override down to
+  256 to stretch context further; up to 1024 for higher-fidelity inspection.
+- Frame count is hard-capped at 32 per call to prevent context blowout.
+- `cleanup=True` (default) deletes files after the response is built. Pass
+  `cleanup=False` to keep paths usable for downstream tools (LUT preview,
+  external image analysis, etc).
+
+---
+
 ## Common Workflows
 
 ### 1. Connect and verify

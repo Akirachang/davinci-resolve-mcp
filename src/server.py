@@ -11,7 +11,7 @@ Usage:
     python src/server.py --full       # Start the 328-tool granular server instead
 """
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 
 import base64
 import os
@@ -46,8 +46,8 @@ RESOLVE_API_PATH = paths["api_path"]
 RESOLVE_LIB_PATH = paths["lib_path"]
 RESOLVE_MODULES_PATH = paths["modules_path"]
 
-os.environ["RESOLVE_SCRIPT_API"] = RESOLVE_API_PATH
-os.environ["RESOLVE_SCRIPT_LIB"] = RESOLVE_LIB_PATH
+os.environ.setdefault("RESOLVE_SCRIPT_API", RESOLVE_API_PATH)
+os.environ.setdefault("RESOLVE_SCRIPT_LIB", RESOLVE_LIB_PATH)
 
 if RESOLVE_MODULES_PATH not in sys.path:
     sys.path.append(RESOLVE_MODULES_PATH)
@@ -184,7 +184,14 @@ def _resolve_safe_dir(path):
     system_temp = tempfile.gettempdir()
     _is_sandbox = False
     if platform.system() == "Darwin":
-        _is_sandbox = path.startswith("/var/") or path.startswith("/private/var/")
+        _is_sandbox = (
+            path.startswith("/var/")
+            or path.startswith("/private/var/")
+            or path.startswith("/tmp/")
+            or path == "/tmp"
+            or path.startswith("/private/tmp/")
+            or path == "/private/tmp"
+        )
     elif platform.system() == "Linux":
         _is_sandbox = path.startswith("/tmp") or path.startswith("/var/tmp")
     elif platform.system() == "Windows":
@@ -294,6 +301,23 @@ def _timecode_to_frame_id(timecode, fps):
         total_minutes = hours * 60 + minutes
         total_frames -= drop_frames * (total_minutes - total_minutes // 10)
     return total_frames, None
+
+
+def _frame_id_to_timecode(frame_id, fps):
+    """Convert a non-negative integer frame id to non-drop HH:MM:SS:FF timecode."""
+    nominal_fps = int(round(float(fps)))
+    if nominal_fps <= 0:
+        return None, _err("frame rate must be greater than zero")
+    if frame_id is None or frame_id < 0:
+        return None, _err("frame_id must be non-negative")
+    total_frames = int(frame_id)
+    frames = total_frames % nominal_fps
+    total_seconds = total_frames // nominal_fps
+    seconds = total_seconds % 60
+    total_minutes = total_seconds // 60
+    minutes = total_minutes % 60
+    hours = total_minutes // 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}", None
 
 
 def _timeline_timecode_to_frame_id(tl, timecode):
@@ -1988,6 +2012,16 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         current timeline; clip name = basename of Media Pool File Path when set; skips audio extensions.
         source_range_final and frame_ranges tuples are inclusive/inclusive endpoints per that script.
         Default handles=24, gap_max=30. Use handles=0 for gap-only auto handles.
+      get_transcript(track_index?=1, auto_create?=True, settings?, merge?=False)
+          -> {segments, full_text?, track_index, item_count, timeline_start_frame, frame_rate}
+        — Read the timecoded transcript from a subtitle track. Each segment is
+          {start_frame, end_frame, start_seconds, end_seconds, text}. start_seconds/end_seconds
+          are offsets from the timeline start (tl.GetStartFrame() is subtracted before dividing by
+          the project frame rate). If no subtitle track exists and auto_create=True (default),
+          Resolve's CreateSubtitlesFromAudio is invoked with the optional settings dict — same shape
+          as timeline_ai.create_subtitles. Pass auto_create=False to fail fast instead. The
+          transcript text is read via TimelineItem.GetName() on subtitle items (undocumented but
+          stable in Resolve 20.x). merge=True additionally returns a single space-joined full_text.
     """
     p = params or {}
     pm, proj, err = _check()
@@ -2363,7 +2397,65 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
                 "current timeline). frame_ranges lists can be merged/overlapped per clip name."
             ),
         )
-    return _unknown(action, ["list","get_current","set_current","get_name","set_name","get_start_frame","get_end_frame","get_start_timecode","set_start_timecode","get_track_count","add_track","delete_track","get_track_sub_type","set_track_enable","get_track_enabled","set_track_lock","get_track_locked","get_track_name","set_track_name","get_items","delete_clips","set_clips_linked","duplicate","duplicate_clips","create_compound_clip","create_fusion_clip","import_into_timeline","export","get_setting","set_setting","insert_generator","insert_fusion_generator","insert_fusion_composition","insert_ofx_generator","insert_title","insert_fusion_title","get_unique_id","get_node_graph","get_media_pool_item","get_mark_in_out","set_mark_in_out","clear_mark_in_out","convert_to_stereo","get_items_in_track","get_voice_isolation_state","set_voice_isolation_state","extract_source_frame_ranges"])
+    elif action == "get_transcript":
+        track_index = int(p.get("track_index", 1))
+        auto_create = bool(p.get("auto_create", True))
+        merge = bool(p.get("merge", False))
+        settings = p.get("settings") or {}
+
+        sub_count = tl.GetTrackCount("subtitle") or 0
+        if sub_count == 0:
+            if not auto_create:
+                return _err("No subtitle track on the current timeline. Pass auto_create=True to generate one with CreateSubtitlesFromAudio, or call timeline_ai.create_subtitles first.")
+            if not tl.CreateSubtitlesFromAudio(settings):
+                return _err("CreateSubtitlesFromAudio returned False. Verify the timeline has an audio clip with detectable speech.")
+            sub_count = tl.GetTrackCount("subtitle") or 0
+            if sub_count == 0:
+                return _err("CreateSubtitlesFromAudio succeeded but no subtitle track materialized.")
+
+        if track_index < 1 or track_index > sub_count:
+            return _err(f"track_index {track_index} out of range. Timeline has {sub_count} subtitle track(s).")
+
+        try:
+            fps = float(proj.GetSetting("timelineFrameRate"))
+        except (TypeError, ValueError):
+            return _err("Could not parse timelineFrameRate from project settings.")
+        if fps <= 0:
+            return _err(f"Invalid timelineFrameRate: {fps}")
+
+        try:
+            tl_start = int(tl.GetStartFrame())
+        except (TypeError, ValueError):
+            tl_start = 0
+
+        items = tl.GetItemListInTrack("subtitle", track_index) or []
+        segments = []
+        for it in items:
+            try:
+                start_frame = int(it.GetStart())
+                end_frame = int(it.GetEnd())
+            except (TypeError, ValueError):
+                continue
+            segments.append({
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "start_seconds": (start_frame - tl_start) / fps,
+                "end_seconds": (end_frame - tl_start) / fps,
+                "text": it.GetName() or "",
+            })
+        segments.sort(key=lambda s: s["start_frame"])
+
+        result = _ok(
+            segments=segments,
+            track_index=track_index,
+            item_count=len(segments),
+            timeline_start_frame=tl_start,
+            frame_rate=fps,
+        )
+        if merge:
+            result["full_text"] = " ".join(s["text"] for s in segments if s["text"])
+        return result
+    return _unknown(action, ["list","get_current","set_current","get_name","set_name","get_start_frame","get_end_frame","get_start_timecode","set_start_timecode","get_track_count","add_track","delete_track","get_track_sub_type","set_track_enable","get_track_enabled","set_track_lock","get_track_locked","get_track_name","set_track_name","get_items","delete_clips","set_clips_linked","duplicate","duplicate_clips","create_compound_clip","create_fusion_clip","import_into_timeline","export","get_setting","set_setting","insert_generator","insert_fusion_generator","insert_fusion_composition","insert_ofx_generator","insert_title","insert_fusion_title","get_unique_id","get_node_graph","get_media_pool_item","get_mark_in_out","set_mark_in_out","clear_mark_in_out","convert_to_stereo","get_items_in_track","get_voice_isolation_state","set_voice_isolation_state","extract_source_frame_ranges","get_transcript"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4733,6 +4825,475 @@ def script_plugin(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 31: frames
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from src.utils import frame_extraction as _frames_helper
+
+try:
+    from mcp.server.fastmcp import Image as _MCPImage
+except ImportError:  # pragma: no cover
+    _MCPImage = None
+
+
+_FRAMES_DEFAULT_MAX_DIMENSION = 512
+_FRAMES_DEFAULT_COUNT = 8
+_FRAMES_DEFAULT_THUMBS_PER_CLIP = 3
+_FRAMES_HARD_CAP = 32
+
+
+def _frames_output_dir(p: Dict[str, Any], suffix: str) -> str:
+    """Pick + create an output directory, redirecting sandbox paths."""
+    out = p.get("output_dir")
+    if not out:
+        out = os.path.join(tempfile.gettempdir(), f"resolve-mcp-frames-{suffix}-{int(time.time())}")
+    out = _resolve_safe_dir(str(out))
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def _frames_find_clip_anywhere(mp, clip_id: str, proj=None):
+    """Find a Media Pool clip by GetUniqueId, walking from the root folder.
+    If the id matches a timeline item instead, follow its GetMediaPoolItem()
+    backref so callers can pass either MP ids or timeline-item ids."""
+    root = mp.GetRootFolder()
+    if root:
+        mpi = _find_clip(root, str(clip_id))
+        if mpi:
+            return mpi
+    if proj is not None:
+        tl = proj.GetCurrentTimeline()
+        if tl is not None:
+            ti = _find_timeline_item_by_id(tl, clip_id)
+            if ti is not None:
+                try:
+                    return ti.GetMediaPoolItem()
+                except Exception:
+                    return None
+    return None
+
+
+def _frames_clip_metadata(clip) -> Dict[str, Any]:
+    """Read source path, fps, and duration-in-seconds from a MediaPoolItem."""
+    try:
+        props = clip.GetClipProperty() or {}
+    except Exception:
+        props = {}
+    file_path = props.get("File Path") or ""
+    fps = _frames_helper.parse_resolve_fps(props.get("FPS"))
+    duration_s = _frames_helper.parse_resolve_duration_seconds(
+        props.get("Duration"), fps, props.get("Frames")
+    )
+    return {
+        "file_path": file_path,
+        "fps": fps,
+        "duration_seconds": duration_s,
+        "name": props.get("Clip Name") or props.get("File Name") or "",
+    }
+
+
+def _frames_assemble_response(
+    extracted: List[Dict[str, Any]],
+    *,
+    return_images: bool,
+    cleanup: bool,
+    output_dir: str,
+    extras: Dict[str, Any],
+) -> Any:
+    """Build the tool response. When return_images is True, returns a list mixing
+    a JSON metadata dict with one Image content block per extracted frame so the
+    model receives them as viewable images. When False, returns a plain dict."""
+    metadata = {
+        "success": True,
+        "frame_count": len(extracted),
+        "output_dir": output_dir,
+        "cleaned_up": cleanup if not return_images else True,
+        "frames": [
+            {k: v for k, v in entry.items() if k != "_path"} for entry in extracted
+        ],
+        **extras,
+    }
+
+    if not return_images or _MCPImage is None:
+        if cleanup:
+            for entry in extracted:
+                try:
+                    os.remove(entry["_path"])
+                except OSError:
+                    pass
+        return metadata
+
+    images: List[Any] = [metadata]
+    for entry in extracted:
+        try:
+            images.append(_MCPImage(path=entry["_path"]))
+        except Exception:
+            pass
+    if cleanup:
+        for entry in extracted:
+            try:
+                os.remove(entry["_path"])
+            except OSError:
+                pass
+        try:
+            if os.path.isdir(output_dir) and not os.listdir(output_dir):
+                os.rmdir(output_dir)
+        except OSError:
+            pass
+    return images
+
+
+@mcp.tool()
+def frames(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """Extract small thumbnail frames from clips or the timeline so a vision-capable
+    model can actually see the footage. Default mode returns MCP Image content
+    blocks; set return_images=False to receive only paths + metadata.
+
+    Source-media extraction (extract_from_clip, extract_thumbnails) requires
+    ffmpeg on PATH and reads the original file directly (fast, ungraded).
+    Timeline extraction (extract_from_timeline) drives Resolve's
+    ExportCurrentFrameAsStill (slow, applies grading + timeline effects).
+
+    Actions:
+      check_ffmpeg() -> {available, path?, version?, error?}
+
+      extract_from_clip(clip_id, *, count?, timestamps_seconds?, frame_numbers?,
+                        interval_seconds?, max_dimension?=512, format?='jpg',
+                        output_dir?, return_images?=True, cleanup?=True,
+                        max_count?=32) -> mixed list with metadata + Image blocks
+        Provide ONE of count|timestamps_seconds|frame_numbers|interval_seconds.
+        Default: 8 evenly spaced frames across the clip.
+
+      extract_from_timeline(*, start_seconds?, end_seconds?, count?=8,
+                            every_n_seconds?, timestamps_seconds?, max_dimension?=512,
+                            format?='jpg', output_dir?, return_images?=True,
+                            cleanup?=True) -> mixed list
+        Captures graded timeline output. Switches to Color page implicitly via the
+        Resolve API. Slow (~1-2s per frame). For browsing source media use
+        extract_from_clip instead.
+
+      extract_thumbnails(clip_ids, *, count_per_clip?=3, max_dimension?=384,
+                         format?='jpg', output_dir?, return_images?=True,
+                         cleanup?=True) -> mixed list
+        Bulk thumbnail browser across multiple Media Pool clips.
+
+    Notes:
+      - max_dimension is the longest edge in pixels. Defaults are tuned for
+        token-efficient vision: 512 for single-clip extraction, 384 for bulk
+        thumbnails.
+      - Frame count is hard-capped at 32 per call to avoid context blowout.
+      - When cleanup=True (default), files are deleted from disk after the
+        response is built. Pass cleanup=False to keep files for downstream use.
+      - format: jpg (default), png, or webp.
+    """
+    p = params or {}
+
+    if action == "check_ffmpeg":
+        return _frames_helper.check_ffmpeg()
+
+    if action == "extract_from_clip":
+        ff = _frames_helper.check_ffmpeg()
+        if not ff.get("available"):
+            return _err(ff.get("error", "ffmpeg not available"))
+
+        clip_id = p.get("clip_id")
+        if not clip_id:
+            return _err("extract_from_clip requires 'clip_id'.")
+
+        _, proj, mp, err = _get_mp()
+        if err:
+            return err
+        clip = _frames_find_clip_anywhere(mp, clip_id, proj=proj)
+        if not clip:
+            return _err(
+                f"No clip with id={clip_id!r}. Pass either a Media Pool item id "
+                f"(from media_pool/folder get_clips) or a timeline item id "
+                f"(from timeline.get_items)."
+            )
+
+        meta = _frames_clip_metadata(clip)
+        if not meta["file_path"]:
+            return _err("Clip has no readable 'File Path' property.")
+        if not os.path.isfile(meta["file_path"]):
+            return _err(f"Source file does not exist on disk: {meta['file_path']}")
+        if not meta["duration_seconds"]:
+            return _err("Could not determine clip duration from FPS/Frames properties.")
+
+        max_count = int(p.get("max_count") or _FRAMES_HARD_CAP)
+        max_count = max(1, min(max_count, _FRAMES_HARD_CAP))
+        timestamps, sel_err = _frames_helper.normalize_frame_selection(
+            meta["duration_seconds"],
+            meta["fps"],
+            count=p.get("count"),
+            timestamps_seconds=p.get("timestamps_seconds"),
+            frame_numbers=p.get("frame_numbers"),
+            interval_seconds=p.get("interval_seconds"),
+            max_count=max_count,
+        )
+        if sel_err:
+            return _err(sel_err)
+
+        try:
+            ext = _frames_helper._format_to_extension(p.get("format", "jpg"))
+        except ValueError as exc:
+            return _err(str(exc))
+        max_dim = int(p.get("max_dimension") or _FRAMES_DEFAULT_MAX_DIMENSION)
+        out_dir = _frames_output_dir(p, "clip")
+
+        extracted: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(clip_id))[:32]
+        for i, ts in enumerate(timestamps):
+            out_path = os.path.join(out_dir, f"clip_{safe_id}_{i:03d}_{int(round(ts*1000)):08d}ms.{ext}")
+            ok, err_msg = _frames_helper.extract_frame(
+                meta["file_path"], ts, out_path, max_dimension=max_dim,
+            )
+            if not ok:
+                errors.append({"timestamp_seconds": ts, "error": err_msg})
+                continue
+            entry = {
+                "timestamp_seconds": round(ts, 3),
+                "frame_number": int(round(ts * meta["fps"])) if meta["fps"] else None,
+                "path": out_path,
+                "size": os.path.getsize(out_path),
+                "_path": out_path,
+            }
+            extracted.append(entry)
+
+        return _frames_assemble_response(
+            extracted,
+            return_images=bool(p.get("return_images", True)),
+            cleanup=bool(p.get("cleanup", True)),
+            output_dir=out_dir,
+            extras={
+                "clip_id": clip_id,
+                "clip_name": meta["name"],
+                "source_file": meta["file_path"],
+                "fps": meta["fps"],
+                "duration_seconds": round(meta["duration_seconds"], 3),
+                "format": ext,
+                "max_dimension": max_dim,
+                "errors": errors,
+            },
+        )
+
+    if action == "extract_thumbnails":
+        ff = _frames_helper.check_ffmpeg()
+        if not ff.get("available"):
+            return _err(ff.get("error", "ffmpeg not available"))
+
+        clip_ids = p.get("clip_ids") or []
+        if not isinstance(clip_ids, list) or not clip_ids:
+            return _err("extract_thumbnails requires 'clip_ids' (non-empty list).")
+
+        _, proj, mp, err = _get_mp()
+        if err:
+            return err
+
+        per_clip = max(1, int(p.get("count_per_clip") or _FRAMES_DEFAULT_THUMBS_PER_CLIP))
+        # Apply hard cap across the whole call
+        max_total = _FRAMES_HARD_CAP
+        if per_clip * len(clip_ids) > max_total:
+            per_clip = max(1, max_total // max(1, len(clip_ids)))
+
+        try:
+            ext = _frames_helper._format_to_extension(p.get("format", "jpg"))
+        except ValueError as exc:
+            return _err(str(exc))
+        max_dim = int(p.get("max_dimension") or 384)
+        out_dir = _frames_output_dir(p, "thumbs")
+
+        extracted: List[Dict[str, Any]] = []
+        clip_summaries: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for cid in clip_ids:
+            clip = _frames_find_clip_anywhere(mp, cid, proj=proj)
+            if not clip:
+                errors.append({"clip_id": cid, "error": "not found as MP item or timeline item"})
+                continue
+            meta = _frames_clip_metadata(clip)
+            if not meta["file_path"] or not os.path.isfile(meta["file_path"]):
+                errors.append({"clip_id": cid, "error": "missing source file"})
+                continue
+            if not meta["duration_seconds"]:
+                errors.append({"clip_id": cid, "error": "unknown duration"})
+                continue
+
+            timestamps = _frames_helper.evenly_spaced_timestamps(
+                meta["duration_seconds"], per_clip,
+            )
+            safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(cid))[:32]
+            for i, ts in enumerate(timestamps):
+                out_path = os.path.join(out_dir, f"thumb_{safe_id}_{i:02d}.{ext}")
+                ok, err_msg = _frames_helper.extract_frame(
+                    meta["file_path"], ts, out_path, max_dimension=max_dim,
+                )
+                if not ok:
+                    errors.append({"clip_id": cid, "timestamp_seconds": ts, "error": err_msg})
+                    continue
+                extracted.append({
+                    "clip_id": cid,
+                    "clip_name": meta["name"],
+                    "timestamp_seconds": round(ts, 3),
+                    "path": out_path,
+                    "size": os.path.getsize(out_path),
+                    "_path": out_path,
+                })
+            clip_summaries.append({
+                "clip_id": cid,
+                "clip_name": meta["name"],
+                "duration_seconds": round(meta["duration_seconds"], 3),
+            })
+
+        return _frames_assemble_response(
+            extracted,
+            return_images=bool(p.get("return_images", True)),
+            cleanup=bool(p.get("cleanup", True)),
+            output_dir=out_dir,
+            extras={
+                "clips": clip_summaries,
+                "count_per_clip": per_clip,
+                "format": ext,
+                "max_dimension": max_dim,
+                "errors": errors,
+            },
+        )
+
+    if action == "extract_from_timeline":
+        _, proj, err = _check()
+        if err:
+            return err
+        tl = proj.GetCurrentTimeline()
+        if not tl:
+            return _err("No current timeline")
+        if not _has_method(proj, "ExportCurrentFrameAsStill"):
+            return _err("Project.ExportCurrentFrameAsStill is not available in this Resolve build")
+
+        fps, fps_err = _timeline_fps(tl)
+        if fps_err:
+            return fps_err
+        try:
+            timeline_start_frame = int(tl.GetStartFrame() or 0)
+            timeline_end_frame = int(tl.GetEndFrame() or 0)
+        except Exception:
+            timeline_start_frame, timeline_end_frame = 0, 0
+        if timeline_end_frame <= timeline_start_frame:
+            return _err("Timeline duration is zero or unreadable")
+        timeline_duration_seconds = (timeline_end_frame - timeline_start_frame) / fps
+
+        start_s = float(p.get("start_seconds") or 0.0)
+        end_s_raw = p.get("end_seconds")
+        end_s = float(end_s_raw) if end_s_raw is not None else timeline_duration_seconds
+        if end_s <= start_s:
+            return _err("end_seconds must be greater than start_seconds")
+        end_s = min(end_s, timeline_duration_seconds)
+        window = end_s - start_s
+
+        if p.get("timestamps_seconds") is not None:
+            try:
+                relative = [float(t) for t in p["timestamps_seconds"]]
+            except (TypeError, ValueError):
+                return _err("timestamps_seconds must be a list of numbers")
+            timestamps = [start_s + t for t in relative if 0.0 <= t <= window]
+        elif p.get("every_n_seconds") is not None:
+            try:
+                step = float(p["every_n_seconds"])
+            except (TypeError, ValueError):
+                return _err("every_n_seconds must be a number")
+            if step <= 0:
+                return _err("every_n_seconds must be positive")
+            timestamps = []
+            t = start_s + step / 2.0
+            while t < end_s and len(timestamps) < _FRAMES_HARD_CAP:
+                timestamps.append(round(t, 3))
+                t += step
+        else:
+            n = max(1, min(int(p.get("count") or _FRAMES_DEFAULT_COUNT), _FRAMES_HARD_CAP))
+            relative = _frames_helper.evenly_spaced_timestamps(window, n)
+            timestamps = [start_s + t for t in relative]
+
+        if not timestamps:
+            return _err("Frame selection produced zero frames")
+        timestamps = timestamps[:_FRAMES_HARD_CAP]
+
+        try:
+            ext = _frames_helper._format_to_extension(p.get("format", "jpg"))
+        except ValueError as exc:
+            return _err(str(exc))
+        max_dim = int(p.get("max_dimension") or _FRAMES_DEFAULT_MAX_DIMENSION)
+        out_dir = _frames_output_dir(p, "timeline")
+
+        extracted: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for i, ts in enumerate(timestamps):
+            target_frame = timeline_start_frame + int(round(ts * fps))
+            tc, tc_err = _frame_id_to_timecode(target_frame, fps)
+            if tc_err:
+                errors.append({"timestamp_seconds": ts, "error": tc_err.get("error")})
+                continue
+            try:
+                if not tl.SetCurrentTimecode(tc):
+                    errors.append({"timestamp_seconds": ts, "error": f"SetCurrentTimecode({tc}) returned False"})
+                    continue
+            except Exception as exc:
+                errors.append({"timestamp_seconds": ts, "error": f"SetCurrentTimecode raised: {exc}"})
+                continue
+
+            time.sleep(0.15)
+            raw_path = os.path.join(out_dir, f"timeline_{i:03d}_{int(round(ts*1000)):08d}ms.{ext}")
+            try:
+                exported = bool(proj.ExportCurrentFrameAsStill(raw_path))
+            except Exception as exc:
+                errors.append({"timestamp_seconds": ts, "error": f"ExportCurrentFrameAsStill raised: {exc}"})
+                continue
+            if not exported or not os.path.exists(raw_path):
+                errors.append({"timestamp_seconds": ts, "error": "ExportCurrentFrameAsStill failed"})
+                continue
+
+            final_path = raw_path
+            if max_dim and _frames_helper.check_ffmpeg().get("available"):
+                downscaled = os.path.join(out_dir, f"timeline_{i:03d}_{int(round(ts*1000)):08d}ms_s.{ext}")
+                ok, _ = _frames_helper.extract_frame(
+                    raw_path, 0.0, downscaled, max_dimension=max_dim,
+                )
+                if ok:
+                    try:
+                        os.remove(raw_path)
+                    except OSError:
+                        pass
+                    final_path = downscaled
+
+            extracted.append({
+                "timestamp_seconds": round(ts, 3),
+                "timecode": tc,
+                "frame_number": target_frame,
+                "path": final_path,
+                "size": os.path.getsize(final_path),
+                "_path": final_path,
+            })
+
+        return _frames_assemble_response(
+            extracted,
+            return_images=bool(p.get("return_images", True)),
+            cleanup=bool(p.get("cleanup", True)),
+            output_dir=out_dir,
+            extras={
+                "fps": fps,
+                "timeline_start_frame": timeline_start_frame,
+                "timeline_end_frame": timeline_end_frame,
+                "format": ext,
+                "max_dimension": max_dim,
+                "errors": errors,
+            },
+        )
+
+    return _unknown(action, ["check_ffmpeg", "extract_from_clip",
+                             "extract_from_timeline", "extract_thumbnails"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Server Startup
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -4746,5 +5307,5 @@ if __name__ == "__main__":
         run_fastmcp_stdio(granular_mcp)
         sys.exit(0)
 
-    logger.info(f"Starting DaVinci Resolve MCP Server (30 compound tools)")
+    logger.info(f"Starting DaVinci Resolve MCP Server (31 compound tools)")
     run_fastmcp_stdio(mcp)

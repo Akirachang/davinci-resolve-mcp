@@ -31,8 +31,15 @@ def get_resolve_paths():
     platform_name = get_platform()
     
     if platform_name == 'darwin':  # macOS
-        api_path = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
-        lib_path = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
+        # Free Resolve installs scripting headers under /Library/Application Support; Studio
+        # bundles them inside the .app. Prefer whichever exists. The Studio .app also exposes
+        # fusionscript.so at a different location than the free build.
+        studio_api = "/Applications/DaVinci Resolve Studio.app/Contents/Resources/Developer/Scripting"
+        studio_lib = "/Applications/DaVinci Resolve Studio.app/Contents/Libraries/Fusion/fusionscript.so"
+        free_api = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
+        free_lib = "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so"
+        api_path = studio_api if os.path.isdir(studio_api) else free_api
+        lib_path = studio_lib if os.path.isfile(studio_lib) else free_lib
         modules_path = os.path.join(api_path, "Modules")
     
     elif platform_name == 'windows':  # Windows
