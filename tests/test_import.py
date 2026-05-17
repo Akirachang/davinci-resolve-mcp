@@ -37,7 +37,7 @@ def test_utils_syntax():
 
 def test_compound_tool_count():
     source = (PROJECT_ROOT / "src" / "server.py").read_text()
-    assert source.count("@mcp.tool()") == 31
+    assert source.count("@mcp.tool()") == 32
 
 
 def test_granular_tool_count():

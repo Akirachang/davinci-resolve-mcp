@@ -1,8 +1,8 @@
 # DaVinci Resolve MCP Server
 
-[![Version](https://img.shields.io/badge/version-2.7.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
+[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](https://github.com/samuelgursky/davinci-resolve-mcp/releases)
 [![API Coverage](https://img.shields.io/badge/API%20Coverage-100%25-brightgreen.svg)](#api-coverage)
-[![Tools](https://img.shields.io/badge/MCP%20Tools-31%20(328%20full)-blue.svg)](#server-modes)
+[![Tools](https://img.shields.io/badge/MCP%20Tools-32%20(328%20full)-blue.svg)](#server-modes)
 [![Tested](https://img.shields.io/badge/Live%20Tested-98.5%25-green.svg)](#test-results)
 [![DaVinci Resolve](https://img.shields.io/badge/DaVinci%20Resolve-18.5+-darkred.svg)](https://www.blackmagicdesign.com/products/davinciresolve)
 [![Python](https://img.shields.io/badge/python-3.10--3.12-green.svg)](https://www.python.org/downloads/)
@@ -13,7 +13,63 @@ A Model Context Protocol (MCP) server providing **complete coverage** of the DaV
 Release/version procedure: see [docs/release-process.md](docs/release-process.md).
 Resolve developer package notes: [Workflow Integrations](docs/workflow-integrations.md), [OpenFX](docs/openfx-notes.md), [LUTs](docs/lut-notes.md), [Fusion Templates](docs/fusion-template-notes.md), [DCTL](docs/dctl-notes.md), [Codec Plugins](docs/codec-plugin-notes.md), [Fuse + DCTL Authoring (experimental)](docs/fuse-dctl-authoring.md), [Script Plugin Authoring + Conversational Lua/Python](docs/script-plugin-authoring.md).
 
-### What's New in v2.7.0
+### What's New in v2.8.0
+
+Accurate, word-aligned subtitles — a new `subtitles` compound tool drives
+WhisperX (Whisper + wav2vec2 forced alignment) to produce subtitles whose
+timestamps actually snap to speech onsets, bypassing Resolve's built-in
+`CreateSubtitlesFromAudio` (which has loose word/phrase timing).
+
+**New `subtitles` compound tool**: five actions covering the practical
+"replace Resolve's loose auto-captions with tight forced-aligned ones" loop.
+- `check_engine()` — diagnostic for the `whisperx` CLI dependency. Returns
+  `{available, path, version, error?}` with a clear `pip install whisperx`
+  install hint if missing.
+- `render_audio(*, output_dir?, custom_name?, timeout_seconds?)` — export the
+  current timeline's audio to a sandbox-safe WAV via the standard render queue
+  (`ExportVideo=False, ExportAudio=True`, LinearPCM 48k/16-bit). Building
+  block; useful to resume mid-pipeline.
+- `align(audio_path, *, language?='auto', model?='small', compute_type?='int8',
+  output_dir?, extra_args?, timeout_seconds?)` — invoke whisperx on an existing
+  audio file. `extra_args` is appended verbatim as an escape hatch for CLI
+  flags that drift across whisperx versions.
+- `import_srt(srt_path, *, append?=True, track_index?=1, create_track?=True)`
+  — best-effort `MediaPool.ImportMedia` probe (undocumented for SRT) and
+  `AppendToTimeline`. Always returns the SRT path with a one-line drag-import
+  instruction when Resolve's API refuses.
+- `generate(*, language?, model?, compute_type?, output_dir?, keep_audio?=True,
+  keep_intermediates?=False, auto_import?=True, append?=True, ...)` —
+  end-to-end pipeline. On per-stage failure returns
+  `{"error", "stage", "audio_path"?}` so the caller can resume from a building
+  block without re-running prior stages.
+
+**Why this matters**: Resolve's built-in transcription is approximate at the
+phrase level and rough at the word level. WhisperX's forced-alignment pass
+uses wav2vec2 to snap each word's start/end to the actual audio waveform, so
+karaoke-style word-by-word captions, exported transcripts, and re-cut edits
+based on transcript timestamps all line up correctly.
+
+**Two-layer fallback strategy**: Resolve's scripting API has no documented SRT
+import method (only `CreateSubtitlesFromAudio` and `AddTrack`). The
+`import_srt` action probes `MediaPool.ImportMedia` (the same path UI
+drag-import uses); when Resolve silently drops the SRT, the envelope always
+includes `srt_path` + a manual-import instruction so no work is ever lost.
+
+**New optional dependency**: `whisperx` on PATH (`pip install whisperx`). All
+other tools are unaffected. The end-to-end `generate` pipeline also uses the
+existing `ffmpeg` dependency.
+
+**Validation**: 24 hermetic unit tests across `tests/test_whisperx_runner.py`
+(CLI command-shape, version probe, output-path resolution, downmix-to-mono)
+and `tests/test_subtitles_tool.py` (action dispatch, input validation, the
+import-probe fallback paths for empty-result and raised-exception cases). Live
+harness `tests/live_whisperx_validation.py` creates a disposable project with
+synthetic speech audio and exercises the full `render_audio → align →
+import_srt → generate` pipeline.
+
+**Compound tool count: 31 → 32**. Granular tool count unchanged at 328.
+
+### v2.7.0
 
 Vision for the model — a new `frames` compound tool extracts small thumbnail
 JPEGs from clips or the timeline and returns them as MCP `Image` content blocks

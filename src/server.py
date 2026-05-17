@@ -2,8 +2,9 @@
 """
 DaVinci Resolve MCP Server (Compound Tools)
 
-30 compound tools covering 100% of the DaVinci Resolve Scripting API (336 methods)
-plus Fusion Fuse, DCTL, and Resolve-page Script authoring tools.
+32 compound tools covering 100% of the DaVinci Resolve Scripting API (336 methods)
+plus Fusion Fuse, DCTL, Resolve-page Script authoring tools, vision (`frames`),
+and WhisperX-aligned subtitle generation (`subtitles`).
 Each tool groups related operations via an 'action' parameter.
 
 Usage:
@@ -11,7 +12,7 @@ Usage:
     python src/server.py --full       # Start the 328-tool granular server instead
 """
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 import base64
 import os
@@ -5430,6 +5431,427 @@ def frames(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 32: subtitles
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from src.utils import whisperx_runner as _whisperx_helper
+
+
+_SUBS_DEFAULT_MODEL = "small"
+_SUBS_DEFAULT_LANGUAGE = "auto"
+_SUBS_RENDER_POLL_SECONDS = 1.0
+_SUBS_RENDER_MIN_TIMEOUT = 60
+_SUBS_RENDER_MAX_TIMEOUT = 1800
+
+
+def _subs_output_dir(p: Dict[str, Any], suffix: str) -> str:
+    """Pick + create an output directory, redirecting sandbox paths."""
+    out = p.get("output_dir")
+    if not out:
+        out = os.path.join(tempfile.gettempdir(), f"resolve-mcp-subs-{suffix}-{int(time.time())}")
+    out = _resolve_safe_dir(str(out))
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def _subs_safe_filename(name: str) -> str:
+    """Sanitize a timeline name for use as an output basename."""
+    s = re.sub(r"[^A-Za-z0-9_-]", "_", str(name or "timeline"))
+    return s[:48] or "timeline"
+
+
+def _subs_render_audio(proj, tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Render the current timeline's audio to a WAV via the standard render queue.
+
+    Returns either `_ok(audio_path=..., job_id=..., format=..., basename=...)`
+    or `_err(...)`. Always restores nothing — caller may delete the render job.
+    """
+    if proj.IsRenderingInProgress():
+        return _err("Cannot start subtitle audio render: a render is already in progress.")
+
+    out_dir = _subs_output_dir(p, "audio")
+    basename = _subs_safe_filename(p.get("custom_name") or tl.GetName() or "timeline")
+    basename = f"{basename}_{int(time.time())}"
+
+    try:
+        proj.SetCurrentRenderFormatAndCodec("wav", "LinearPCM")
+    except Exception as exc:
+        return _err(f"SetCurrentRenderFormatAndCodec('wav','LinearPCM') failed: {exc}")
+
+    settings = {
+        "TargetDir": out_dir,
+        "CustomName": basename,
+        "ExportVideo": False,
+        "ExportAudio": True,
+        "AudioCodec": "LinearPCM",
+        "AudioSampleRate": 48000,
+        "AudioBitDepth": 16,
+        "SelectAllFrames": True,
+    }
+    if not proj.SetRenderSettings(settings):
+        return _err("SetRenderSettings returned False for audio-only render preset.")
+
+    jid = proj.AddRenderJob()
+    if not jid:
+        return _err("Failed to add render job for subtitle audio extraction.")
+
+    try:
+        if not proj.StartRendering([jid], False):
+            proj.DeleteRenderJob(jid)
+            return _err("StartRendering returned False for subtitle audio render.")
+
+        try:
+            fps = float(proj.GetSetting("timelineFrameRate"))
+        except (TypeError, ValueError):
+            fps = 0.0
+        try:
+            tl_start = int(tl.GetStartFrame() or 0)
+            tl_end = int(tl.GetEndFrame() or 0)
+        except Exception:
+            tl_start, tl_end = 0, 0
+        duration_s = max(0.0, (tl_end - tl_start) / fps) if fps > 0 else 0.0
+        timeout = int(p.get("timeout_seconds") or 0)
+        if timeout <= 0:
+            timeout = max(_SUBS_RENDER_MIN_TIMEOUT, min(int(duration_s * 4) + 30, _SUBS_RENDER_MAX_TIMEOUT))
+
+        waited = 0.0
+        while proj.IsRenderingInProgress() and waited < timeout:
+            time.sleep(_SUBS_RENDER_POLL_SECONDS)
+            waited += _SUBS_RENDER_POLL_SECONDS
+        if proj.IsRenderingInProgress():
+            try:
+                proj.StopRendering()
+            except Exception:
+                pass
+            proj.DeleteRenderJob(jid)
+            return _err(f"Subtitle audio render exceeded {timeout}s timeout.")
+
+        try:
+            status = proj.GetRenderJobStatus(jid) or {}
+        except Exception:
+            status = {}
+        job_status = status.get("JobStatus") if isinstance(status, dict) else None
+        if job_status and str(job_status).lower() != "complete":
+            err_msg = status.get("Error") or f"render job ended with status {job_status!r}"
+            proj.DeleteRenderJob(jid)
+            return _err(f"Subtitle audio render failed: {err_msg}")
+
+        # Resolve writes <CustomName>.wav inside TargetDir for LinearPCM WAV.
+        candidate = os.path.join(out_dir, basename + ".wav")
+        if not os.path.isfile(candidate):
+            # Fall back to scanning for a single fresh WAV in the dir
+            wavs = [f for f in os.listdir(out_dir) if f.lower().endswith(".wav")]
+            if len(wavs) == 1:
+                candidate = os.path.join(out_dir, wavs[0])
+        if not os.path.isfile(candidate):
+            proj.DeleteRenderJob(jid)
+            return _err(
+                f"Render reported success but no WAV found in {out_dir}. "
+                f"Check that the timeline has at least one enabled audio track."
+            )
+    finally:
+        try:
+            proj.DeleteRenderJob(jid)
+        except Exception:
+            pass
+
+    return _ok(
+        audio_path=candidate,
+        output_dir=out_dir,
+        basename=basename,
+        format="wav",
+        duration_seconds=round(duration_s, 3) if duration_s else None,
+    )
+
+
+def _subs_probe_import_srt(mp, srt_path: str, *, append: bool, track_index: int,
+                           create_track: bool, tl) -> Dict[str, Any]:
+    """Best-effort: import SRT into Media Pool and optionally append to timeline.
+
+    The Resolve scripting API does not document SRT import. UI drag-import goes
+    through MediaPool.ImportMedia, so we probe that path; if Resolve silently
+    drops the SRT (empty result list) or raises, we downgrade to a manual-import
+    fallback that still includes the SRT path so the user can finish by hand.
+    """
+    fallback_msg = (
+        f"Resolve's scripting API did not accept the SRT automatically. "
+        f"Drag this file into the Media Pool, or use File > Import > Subtitle: {srt_path}"
+    )
+    try:
+        imported = mp.ImportMedia([srt_path])
+    except Exception as exc:
+        return {
+            "imported": False,
+            "appended_to_timeline": False,
+            "srt_path": srt_path,
+            "manual_import_required": True,
+            "instructions": f"{fallback_msg} (ImportMedia raised: {exc})",
+        }
+    if not isinstance(imported, list) or not imported:
+        return {
+            "imported": False,
+            "appended_to_timeline": False,
+            "srt_path": srt_path,
+            "manual_import_required": True,
+            "instructions": fallback_msg,
+        }
+
+    clip = imported[0]
+    appended = False
+    appended_count = 0
+    append_error: Optional[str] = None
+    if append and tl is not None:
+        if create_track:
+            try:
+                existing = int(tl.GetTrackCount("subtitle") or 0)
+            except Exception:
+                existing = 0
+            if existing == 0:
+                try:
+                    tl.AddTrack("subtitle")
+                except Exception:
+                    pass
+        try:
+            appended_items = mp.AppendToTimeline([clip])
+        except Exception as exc:
+            appended_items = None
+            append_error = f"AppendToTimeline raised: {exc}"
+        if isinstance(appended_items, list) and appended_items:
+            appended = True
+            appended_count = len(appended_items)
+
+    result = {
+        "imported": True,
+        "clip_count": len(imported),
+        "appended_to_timeline": appended,
+        "appended_item_count": appended_count,
+        "srt_path": srt_path,
+    }
+    if append and not appended:
+        result["manual_import_required"] = True
+        msg = (
+            f"SRT imported into the Media Pool but AppendToTimeline did not produce "
+            f"a subtitle item. Drag the SRT clip from the Media Pool onto a subtitle "
+            f"track on the current timeline. (srt: {srt_path})"
+        )
+        if append_error:
+            msg = f"{msg} [{append_error}]"
+        result["instructions"] = msg
+    return result
+
+
+@mcp.tool()
+def subtitles(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Generate accurate, word-aligned subtitles via WhisperX and import them back
+    into the current timeline. Bypasses Resolve's built-in CreateSubtitlesFromAudio
+    (which has loose word/phrase timing) by routing through Whisper + wav2vec2
+    forced alignment.
+
+    Requires the external `whisperx` CLI on PATH (`pip install whisperx`). The
+    end-to-end `generate` action also uses the existing render queue and `ffmpeg`.
+
+    Actions:
+      check_engine() -> {available, path?, version?, error?}
+        Probe the whisperx CLI; mirrors frames(action="check_ffmpeg").
+
+      render_audio(*, output_dir?, custom_name?, timeout_seconds?) ->
+        {audio_path, output_dir, basename, format, duration_seconds}
+        Render the current timeline's audio to a WAV via the standard render
+        queue (ExportVideo=False, ExportAudio=True, LinearPCM 48k/16-bit).
+        Building block for `generate`; useful to resume after a partial pipeline.
+
+      align(audio_path, *, language?='auto', model?='small',
+            compute_type?='int8', output_dir?, extra_args?: [], timeout_seconds?)
+        -> {srt_path, json_path?, cue_count, language, model}
+        Invoke whisperx on an existing audio file. `extra_args` is appended
+        verbatim as an escape hatch for CLI flags that drift across whisperx
+        versions.
+
+      import_srt(srt_path, *, append?=True, track_index?=1, create_track?=True)
+        -> {imported, appended_to_timeline, srt_path, manual_import_required?,
+            instructions?}
+        Best-effort: probe MediaPool.ImportMedia (undocumented for SRT) and
+        optionally AppendToTimeline. Always returns the SRT path so the user
+        can finish manually if Resolve's API refuses.
+
+      generate(*, language?='auto', model?='small', compute_type?='int8',
+               output_dir?, keep_audio?=True, keep_intermediates?=False,
+               auto_import?=True, append?=True, track_index?=1,
+               extra_args?, timeout_seconds?) -> end-to-end pipeline result
+        Pipeline: check_engine -> render_audio -> align -> import_srt. On
+        per-stage failure, returns _err with `stage` set so the user can resume
+        from a building-block action with the partial outputs preserved.
+    """
+    p = params or {}
+
+    if action == "check_engine":
+        return _whisperx_helper.check_whisperx()
+
+    if action == "render_audio":
+        _, proj, err = _check()
+        if err:
+            return err
+        tl = proj.GetCurrentTimeline()
+        if not tl:
+            return _err("No current timeline")
+        return _subs_render_audio(proj, tl, p)
+
+    if action == "align":
+        audio_path = p.get("audio_path")
+        if not audio_path:
+            return _err("align requires 'audio_path'.")
+        if not os.path.isfile(audio_path):
+            return _err(f"audio_path does not exist: {audio_path}")
+        engine = _whisperx_helper.check_whisperx()
+        if not engine.get("available"):
+            return _err(engine.get("error", "whisperx not available"))
+        out_dir = _subs_output_dir(p, "align")
+        model = str(p.get("model") or _SUBS_DEFAULT_MODEL)
+        language = str(p.get("language") or _SUBS_DEFAULT_LANGUAGE)
+        compute_type = str(p.get("compute_type") or "int8")
+        extra_args = p.get("extra_args") or []
+        if extra_args and not isinstance(extra_args, list):
+            return _err("extra_args must be a list of strings")
+        timeout = float(p.get("timeout_seconds") or 900.0)
+
+        ok, err_msg, info = _whisperx_helper.run_whisperx(
+            audio_path, out_dir,
+            model=model, language=language, compute_type=compute_type,
+            extra_args=extra_args, timeout_seconds=timeout,
+        )
+        if not ok:
+            return _err(f"whisperx failed: {err_msg}")
+        srt_path = _whisperx_helper.find_output_srt(out_dir, audio_path)
+        if not srt_path:
+            return _err(f"whisperx exited successfully but no .srt was found in {out_dir}")
+        json_path = _whisperx_helper.find_output_json(out_dir, audio_path)
+        cue_count = _whisperx_helper.count_srt_cues(srt_path)
+        return _ok(
+            srt_path=srt_path,
+            json_path=json_path,
+            output_dir=out_dir,
+            cue_count=cue_count,
+            language=language,
+            model=model,
+        )
+
+    if action == "import_srt":
+        srt_path = p.get("srt_path")
+        if not srt_path:
+            return _err("import_srt requires 'srt_path'.")
+        if not os.path.isfile(srt_path):
+            return _err(f"srt_path does not exist: {srt_path}")
+        _, proj, mp, err = _get_mp()
+        if err:
+            return err
+        tl = proj.GetCurrentTimeline() if proj is not None else None
+        append = bool(p.get("append", True))
+        track_index = int(p.get("track_index", 1))
+        create_track = bool(p.get("create_track", True))
+        probe = _subs_probe_import_srt(
+            mp, srt_path,
+            append=append, track_index=track_index,
+            create_track=create_track, tl=tl,
+        )
+        return _ok(**probe)
+
+    if action == "generate":
+        engine = _whisperx_helper.check_whisperx()
+        if not engine.get("available"):
+            return _err(engine.get("error", "whisperx not available"))
+
+        _, proj, mp, err = _get_mp()
+        if err:
+            return err
+        tl = proj.GetCurrentTimeline()
+        if not tl:
+            return _err("No current timeline")
+
+        render_result = _subs_render_audio(proj, tl, p)
+        if "error" in render_result:
+            render_result["stage"] = "render_audio"
+            return render_result
+        audio_path = render_result["audio_path"]
+        audio_dir = render_result["output_dir"]
+
+        out_dir = _subs_output_dir(p, "align")
+        model = str(p.get("model") or _SUBS_DEFAULT_MODEL)
+        language = str(p.get("language") or _SUBS_DEFAULT_LANGUAGE)
+        compute_type = str(p.get("compute_type") or "int8")
+        extra_args = p.get("extra_args") or []
+        if extra_args and not isinstance(extra_args, list):
+            return {"error": "extra_args must be a list of strings",
+                    "stage": "align", "audio_path": audio_path}
+        timeout = float(p.get("timeout_seconds") or 900.0)
+
+        ok, err_msg, _info = _whisperx_helper.run_whisperx(
+            audio_path, out_dir,
+            model=model, language=language, compute_type=compute_type,
+            extra_args=extra_args, timeout_seconds=timeout,
+        )
+        if not ok:
+            return {"error": f"whisperx failed: {err_msg}",
+                    "stage": "align", "audio_path": audio_path}
+        srt_path = _whisperx_helper.find_output_srt(out_dir, audio_path)
+        if not srt_path:
+            return {"error": f"whisperx produced no .srt in {out_dir}",
+                    "stage": "align", "audio_path": audio_path}
+        json_path = _whisperx_helper.find_output_json(out_dir, audio_path)
+        cue_count = _whisperx_helper.count_srt_cues(srt_path)
+
+        import_result: Dict[str, Any] = {}
+        if bool(p.get("auto_import", True)):
+            import_result = _subs_probe_import_srt(
+                mp, srt_path,
+                append=bool(p.get("append", True)),
+                track_index=int(p.get("track_index", 1)),
+                create_track=bool(p.get("create_track", True)),
+                tl=tl,
+            )
+
+        keep_audio = bool(p.get("keep_audio", True))
+        keep_intermediates = bool(p.get("keep_intermediates", False))
+        cleaned: List[str] = []
+        if not keep_audio and import_result.get("imported"):
+            try:
+                os.remove(audio_path)
+                cleaned.append(audio_path)
+            except OSError:
+                pass
+        if not keep_intermediates:
+            for entry in list(os.listdir(out_dir) if os.path.isdir(out_dir) else []):
+                full = os.path.join(out_dir, entry)
+                if full == srt_path:
+                    continue
+                if entry.lower().endswith((".vtt", ".tsv", ".txt")):
+                    try:
+                        os.remove(full)
+                        cleaned.append(full)
+                    except OSError:
+                        pass
+
+        return _ok(
+            stage="complete",
+            srt_path=srt_path,
+            json_path=json_path if (keep_intermediates or import_result.get("imported")) else json_path,
+            audio_path=audio_path if keep_audio or not import_result.get("imported") else None,
+            audio_dir=audio_dir,
+            output_dir=out_dir,
+            cue_count=cue_count,
+            language=language,
+            model=model,
+            imported=bool(import_result.get("imported")),
+            appended_to_timeline=bool(import_result.get("appended_to_timeline")),
+            manual_import_required=bool(import_result.get("manual_import_required")),
+            instructions=import_result.get("instructions"),
+            cleaned=cleaned,
+        )
+
+    return _unknown(action, ["check_engine", "render_audio", "align",
+                             "import_srt", "generate"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Server Startup
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -5443,5 +5865,5 @@ if __name__ == "__main__":
         run_fastmcp_stdio(granular_mcp)
         sys.exit(0)
 
-    logger.info(f"Starting DaVinci Resolve MCP Server (31 compound tools)")
+    logger.info(f"Starting DaVinci Resolve MCP Server (32 compound tools)")
     run_fastmcp_stdio(mcp)

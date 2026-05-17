@@ -446,6 +446,77 @@ Notes:
 
 ---
 
+### Subtitles (v2.8.0+)
+
+**`subtitles`** — Generate accurate, word-aligned subtitles via WhisperX and
+import them back into the current timeline. Bypasses Resolve's built-in
+`CreateSubtitlesFromAudio` (which produces loose word/phrase timing) by routing
+through Whisper + wav2vec2 forced alignment.
+
+Requires the external `whisperx` CLI on PATH (`pip install whisperx`). The
+end-to-end `generate` action additionally uses Resolve's render queue and
+`ffmpeg`. All three are gated behind `check_engine` / `check_ffmpeg` probes
+that return clear install hints, not stack traces.
+
+Actions:
+- `check_engine` — diagnostic; returns `{available, path, version, error?}`
+- `render_audio(*, output_dir?, custom_name?, timeout_seconds?)` — export the
+  current timeline's audio to a sandbox-safe WAV via the standard render queue
+  (`ExportVideo=False, ExportAudio=True`, LinearPCM 48k/16-bit). Building
+  block for `generate`; useful to resume mid-pipeline.
+- `align(audio_path, *, language?='auto', model?='small', compute_type?='int8',
+  output_dir?, extra_args?, timeout_seconds?)` — invoke whisperx on an existing
+  audio file. `extra_args` is appended verbatim as an escape hatch for CLI
+  flags that drift across whisperx versions.
+- `import_srt(srt_path, *, append?=True, track_index?=1, create_track?=True)`
+  — best-effort `MediaPool.ImportMedia` probe (undocumented for SRT in
+  Resolve's scripting API), then `AppendToTimeline`. Always returns
+  `srt_path` so the user can finish manually if Resolve refuses.
+- `generate(*, language?, model?, compute_type?, output_dir?, keep_audio?=True,
+  keep_intermediates?=False, auto_import?=True, append?=True, track_index?=1,
+  extra_args?, timeout_seconds?)` — end-to-end:
+  `render_audio` → `align` → `import_srt`. On per-stage failure, returns
+  `{"error", "stage", "audio_path"?}` so the caller can resume from a building
+  block without re-running prior stages.
+
+Practical recipe — "replace Resolve's loose auto-captions with WhisperX
+forced-aligned subtitles":
+
+```
+subtitles(action="generate", params={"model": "small", "language": "en"})
+# Pipeline runs end-to-end. On success returns {srt_path, json_path, cue_count,
+# imported, appended_to_timeline, manual_import_required, instructions?}.
+```
+
+Practical recipe — "resume after a partial pipeline":
+
+```
+# Audio was rendered but whisperx crashed; rerun just the align step.
+subtitles(action="align",
+          params={"audio_path": "/Users/.../resolve-stills/timeline_..._....wav",
+                  "model": "small"})
+```
+
+Notes:
+- **Resolve's scripting API does not document SRT import.** The probe in
+  `import_srt` tries the same `MediaPool.ImportMedia` path that UI drag-import
+  uses; on some Resolve builds this works end-to-end, on others it silently
+  returns an empty list. When the probe fails, the return envelope always
+  includes the SRT path and a one-line instruction to drag-import manually.
+- `render_audio` refuses to start if `IsRenderingInProgress()` is true — it
+  will not queue politely behind unknown work. Stop or finish the existing
+  render first.
+- Default model is `small`; for speed in CI / quick iteration use `tiny`. For
+  highest quality use `large-v3` (much slower; CPU users will want
+  `compute_type="int8"` which is already the default).
+- WhisperX writes `.srt`, `.vtt`, `.tsv`, `.json` per input. We surface
+  `.srt` and `.json` (the latter has word-level timing data); the `.vtt` /
+  `.tsv` are deleted unless `keep_intermediates=True`.
+- **External binary dependencies**: `whisperx` (required), `ffmpeg` (required
+  for the optional resample step). Both are probed before any expensive work.
+
+---
+
 ## Common Workflows
 
 ### 1. Connect and verify
