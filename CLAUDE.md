@@ -37,7 +37,7 @@ env RESOLVE_SCRIPT_API="/Library/Application Support/Blackmagic Design/DaVinci R
     venv/bin/python tests/live_v233_validation.py
 
 # Run the server directly (normally invoked by the MCP client)
-python src/server.py            # compound (30 tools)
+python src/server.py            # compound (31 tools)
 python src/server.py --full     # granular (328 tools)
 ```
 
